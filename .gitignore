@@ -1,0 +1,32 @@
+# ── 허용 목록(allowlist) 방식 ─────────────────────────────
+# 기본은 "전부 제외"이고, 배포할 파일만 아래에서 다시 허용한다.
+# 연구 자료(raw/ state/ library/ out/ review/ 등)는 목록에 없으므로 자동으로 빠진다.
+# 새 파일·폴더를 배포하려면 여기에 "!" 줄을 추가한다.
+
+# 루트의 모든 파일·폴더 제외
+/*
+
+# 배포 대상 — 저장소 안내·설정 파일
+!/.gitignore
+!/README.md
+!/LICENSE
+!/requirements.txt
+!/CLAUDE.md
+
+# 배포 대상 — 에이전트 Skill(절차서·도구·참고 형식)만 허용
+!/.claude/
+/.claude/*
+!/.claude/skills/
+
+# 허용한 폴더 안에서도 다시 제외하는 것
+# 파이썬 실행 캐시
+__pycache__/
+*.pyc
+# 비밀값(API 키 등)을 담을 수 있는 설정 파일
+config.json
+.env
+*.local.json
+# 운영체제·편집기 임시 파일
+.DS_Store
+Thumbs.db
+~$*

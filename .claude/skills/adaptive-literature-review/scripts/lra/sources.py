@@ -62,10 +62,10 @@ class OpenAlex:
         self.calls = 0        # 실제 네트워크 요청 수(캐시 적중 제외)
         self.cost = 0.0       # OpenAlex가 보고한 비용(USD)
 
-    def _get(self, path: str, params: dict, cache: bool = True):
+    def _get(self, path: str, params: dict, cache: bool = True, max_age: float | None = None):
         p = {**self.base, **params}
         self.http.last_headers = {}
-        body = self.http.get_json(OA + path, p, cache=cache, min_interval=0.12)
+        body = self.http.get_json(OA + path, p, cache=cache, min_interval=0.12, max_age=max_age)
         h = self.http.last_headers
         if h:  # 캐시 적중이면 비어 있음
             self.calls += 1
@@ -112,11 +112,11 @@ class OpenAlex:
             params["sort"] = sort
         return self._get("/works", params)
 
-    def work(self, ident: str):
+    def work(self, ident: str, max_age: float | None = None):
         """W-ID 또는 DOI. 단건 조회는 무료."""
         if ident.startswith("10."):
             ident = "doi:" + ident
-        return self._get(f"/works/{ident}", {"select": OA_SELECT})
+        return self._get(f"/works/{ident}", {"select": OA_SELECT}, max_age=max_age)
 
     def works_by_ids(self, wids: list[str], extra_filter: str = ""):
         out = []
@@ -195,14 +195,14 @@ class Crossref:
         self.http = http
         self.params = {"mailto": cfg["mailto"]} if cfg.get("mailto") else {}
 
-    def work(self, doi: str):
-        body = self.http.get_json(f"{CR}/works/{doi}", dict(self.params), min_interval=0.2)
+    def work(self, doi: str, max_age: float | None = None):
+        body = self.http.get_json(f"{CR}/works/{doi}", dict(self.params), min_interval=0.2, max_age=max_age)
         return (body or {}).get("message") if body else None
 
-    def notices_updating(self, doi: str):
+    def notices_updating(self, doi: str, max_age: float | None = None):
         """이 DOI를 갱신(정정·철회 등)하는 공지 목록."""
         body = self.http.get_json(f"{CR}/works", {**self.params, "filter": f"updates:{doi}", "rows": 20},
-                                  min_interval=0.2)
+                                  min_interval=0.2, max_age=max_age)
         return ((body or {}).get("message") or {}).get("items", [])
 
 

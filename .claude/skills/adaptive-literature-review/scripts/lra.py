@@ -659,7 +659,8 @@ def cmd_bibcheck(a):
 def cmd_integrity(a):
     paths, con, cfg, http = ctx(a)
     cr = Crossref(http, cfg)
-    res = [P.integrity_check(con, cr, pid) for pid in _targets(con, a)]
+    oa = OpenAlex(http, cfg, all_types=True)
+    res = [P.integrity_check(con, cr, pid, oa) for pid in _targets(con, a)]
     con.commit()
     out([r for r in res if r["status"] != "NO_KNOWN_ALERT"] or "모두 NO_KNOWN_ALERT (철회 없음의 보증은 아님)")
 

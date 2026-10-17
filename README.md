@@ -5,6 +5,8 @@
 
 *An adaptive literature discovery, analysis, and synthesis workflow for Claude Code.*
 
+https://github.com/user-attachments/assets/ac382c96-bfc7-4076-b0d0-20296674a76f
+
 | 이런 일을 대신합니다 | 이런 것은 하지 않습니다 |
 |---|---|
 | 분야별 주요 학술지부터 검색하고 인용망으로 넓혀 핵심문헌 선정 | 없는 논문·DOI·인용문·쪽수를 만들어 내기 |

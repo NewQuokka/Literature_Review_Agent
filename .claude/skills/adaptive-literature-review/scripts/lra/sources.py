@@ -5,8 +5,9 @@
 from __future__ import annotations
 
 import json
+from urllib.parse import quote
 
-from .config import Http
+from .config import Http, HttpError
 
 OA = "https://api.openalex.org"
 CR = "https://api.crossref.org"
@@ -34,6 +35,16 @@ def norm_doi(doi: str | None) -> str | None:
         if d.startswith(p):
             d = d[len(p):]
     return d or None
+
+
+def search_value(q: str) -> str:
+    """OpenAlex filter 값으로 넣을 검색어. 쉼표는 filter 구분자라 공백으로 바꾼다(#10)."""
+    return " ".join(q.replace(",", " ").split())
+
+
+def doi_path(doi: str) -> str:
+    """URL 경로에 넣을 DOI. `#`·`?`·`<>` 등이 잘리거나 바뀌지 않게 인코딩한다(#6)."""
+    return quote(doi, safe="/")
 
 
 def abstract_from_inverted(inv: dict | None) -> str | None:
@@ -99,7 +110,7 @@ class OpenAlex:
         if field == "keyword":
             params["search"] = query
         else:
-            flt.append(f"{field}.search:{query}")
+            flt.append(f"{field}.search:{search_value(query)}")
         if filters:
             flt.append(filters)
         if source_ids:  # Stage A: 우선 학술출처로 제한
@@ -115,7 +126,7 @@ class OpenAlex:
     def work(self, ident: str, max_age: float | None = None):
         """W-ID 또는 DOI. 단건 조회는 무료."""
         if ident.startswith("10."):
-            ident = "doi:" + ident
+            ident = "doi:" + doi_path(ident)
         return self._get(f"/works/{ident}", {"select": OA_SELECT}, max_age=max_age)
 
     def works_by_ids(self, wids: list[str], extra_filter: str = ""):
@@ -134,7 +145,7 @@ class OpenAlex:
     def citing(self, wid: str, query: str = "", per_page: int = 50, filters: str = ""):
         flt = [f"cites:{short_oa(wid)}"]
         if query:
-            flt.append(f"title_and_abstract.search:{query}")
+            flt.append(f"title_and_abstract.search:{search_value(query)}")
         if filters:
             flt.append(filters)
         if self.type_filter:
@@ -196,7 +207,7 @@ class Crossref:
         self.params = {"mailto": cfg["mailto"]} if cfg.get("mailto") else {}
 
     def work(self, doi: str, max_age: float | None = None):
-        body = self.http.get_json(f"{CR}/works/{doi}", dict(self.params), min_interval=0.2, max_age=max_age)
+        body = self.http.get_json(f"{CR}/works/{doi_path(doi)}", dict(self.params), min_interval=0.2, max_age=max_age)
         return (body or {}).get("message") if body else None
 
     def notices_updating(self, doi: str, max_age: float | None = None):
@@ -212,7 +223,7 @@ class SemanticScholar:
         self.headers = {"x-api-key": cfg["s2_api_key"]} if cfg.get("s2_api_key") else {}
 
     def paper(self, doi: str):
-        return self.http.get_json(f"{S2}/paper/DOI:{doi}",
+        return self.http.get_json(f"{S2}/paper/DOI:{doi_path(doi)}",
                                   {"fields": "title,abstract,openAccessPdf,externalIds,year,venue"},
                                   headers=self.headers, min_interval=1.1)
 
@@ -264,8 +275,12 @@ class KCI:
         if cache and self.http.use_cache and ck.exists():
             raw = json.loads(ck.read_text(encoding="utf-8"))["body"]
         else:
-            r = self.http.s.get(KCI_URL, params=p, timeout=60)
-            r.raise_for_status()
+            try:
+                r = self.http.request(KCI_URL, p)
+            except HttpError as e:
+                raise KCIError(str(e)) from None
+            if r is None:
+                raise KCIError("KCI 응답 404")
             raw = r.content.decode("utf-8", "replace")
             self.calls += 1
         root = ET.fromstring(raw.encode("utf-8"))

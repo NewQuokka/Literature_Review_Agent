@@ -293,7 +293,9 @@ def integrity_check(con, cr: Crossref, pid: str, oa: OpenAlex | None = None) -> 
         alerts.append({"type": "retraction", "source": "openalex.is_retracted"})
     if p["doi"]:
         try:
-            m = cr.work(p["doi"], max_age=INTEGRITY_MAX_AGE) or {}
+            m = cr.work(p["doi"], max_age=INTEGRITY_MAX_AGE)
+            if m is None:  # 아무것도 확인하지 못했으므로 '경고 없음'이 아니다
+                raise LookupError("Crossref 미등록(404) — DataCite 등 다른 등록기관 DOI일 수 있음")
             sources.append("crossref.updated-by")
             for u in m.get("updated-by") or []:
                 alerts.append({"type": u.get("type"), "notice_doi": u.get("DOI"), "source": u.get("source"),
@@ -330,6 +332,13 @@ def integrity_check(con, cr: Crossref, pid: str, oa: OpenAlex | None = None) -> 
             status = cand
     if not p["doi"] and status == "UNKNOWN" and not alerts:
         status = "UNKNOWN"  # DOI가 없어 Crossref 조회 불가
+    if status == "UNKNOWN":
+        # 조회 실패가 이전에 확인된 철회·정정을 덮어쓰지 않게 한다. 해제는 조회에 성공한 결과로만(#6)
+        prev = db.integrity_status(con, pid)
+        if prev in ("RETRACTED", "EXPRESSION_OF_CONCERN", "CORRECTED"):
+            status = prev
+        if status != "UNKNOWN":
+            alerts.append({"type": "carried_over", "detail": f"이번 조회 실패, 이전 {status} 유지"})
     follow = 1 if status in ("RETRACTED", "EXPRESSION_OF_CONCERN", "CORRECTED", "UNKNOWN") else 0
     con.execute("INSERT INTO publication_updates(paper_id, status, source, detail, checked_at, follow_up_required) VALUES (?,?,?,?,?,?)",
                 (pid, status, ",".join(sources), json.dumps(alerts, ensure_ascii=False), db.now(), follow))

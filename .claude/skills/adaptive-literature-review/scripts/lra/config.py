@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -35,6 +36,22 @@ class Paths:
         for p in (self.raw, self.state, self.cache, self.text, self.quarantine,
                   self.library / "Core", self.library / "Extended", self.out):
             p.mkdir(parents=True, exist_ok=True)
+
+
+_SECRET_RE = re.compile(r"((?:api_key|key|mailto)=)[^&\s'\"]+", re.I)
+
+
+def redact(s: str) -> str:
+    """URL·오류 메시지의 API 키·이메일을 가린다(대화 기록·로그에 남지 않게)."""
+    return _SECRET_RE.sub(r"\1***", s)
+
+
+class HttpError(RuntimeError):
+    """비밀값을 가린 HTTP 오류. 원래 예외(키가 든 URL 포함)는 연결하지 않는다."""
+
+    def __init__(self, msg: str, status: int | None = None):
+        super().__init__(redact(msg))
+        self.status = status
 
 
 def load_config(paths: Paths) -> dict:
@@ -69,6 +86,36 @@ class Http:
         h = hashlib.sha1((url + json.dumps(p, ensure_ascii=False)).encode()).hexdigest()
         return self.paths.cache / f"{h}.json"
 
+    def request(self, url: str, params: dict | None = None, headers: dict | None = None,
+                min_interval: float = 0.0, retries: int = 3):
+        """GET(재시도 포함). 404면 None. 실패 시 비밀값을 가린 HttpError.
+        시간 초과·연결 오류도 429·5xx처럼 재시도한다."""
+        host = url.split("/")[2]
+        last = ""
+        for attempt in range(retries):
+            wait = min_interval - (time.time() - self._last_call.get(host, 0))
+            if wait > 0:
+                time.sleep(wait)
+            self._last_call[host] = time.time()
+            try:
+                r = self.s.get(url, params=params, headers=headers or {}, timeout=60)
+            except (requests.Timeout, requests.ConnectionError) as e:
+                last = f"{type(e).__name__}: {e}"
+                time.sleep(2 * (attempt + 1))
+                continue
+            self.last_headers = r.headers
+            if r.status_code == 429 or r.status_code >= 500:
+                last = f"상태 {r.status_code}: {r.text[:200]}"
+                ra = r.headers.get("Retry-After")
+                time.sleep(float(ra) if ra and ra.isdigit() and int(ra) < 60 else 2 * (attempt + 1))
+                continue
+            if r.status_code == 404:
+                return None
+            if r.status_code >= 400:
+                raise HttpError(f"HTTP {r.status_code}: {url} — {r.text[:200]}", r.status_code) from None
+            return r
+        raise HttpError(f"HTTP 재시도 초과: {url} (마지막 {last})") from None
+
     def get_json(self, url: str, params: dict | None = None, headers: dict | None = None,
                  min_interval: float = 0.0, cache: bool = True, retries: int = 3,
                  max_age: float | None = None):
@@ -78,25 +125,12 @@ class Http:
         if (self.use_cache and cache and ck.exists()
                 and (max_age is None or time.time() - ck.stat().st_mtime <= max_age)):
             return json.loads(ck.read_text(encoding="utf-8"))["body"]
-        host = url.split("/")[2]
-        for attempt in range(retries):
-            wait = min_interval - (time.time() - self._last_call.get(host, 0))
-            if wait > 0:
-                time.sleep(wait)
-            self._last_call[host] = time.time()
-            r = self.s.get(url, params=params, headers=headers or {}, timeout=60)
-            self.last_headers = dict(r.headers)
-            if r.status_code == 429 or r.status_code >= 500:
-                ra = r.headers.get("Retry-After")
-                time.sleep(float(ra) if ra and ra.isdigit() and int(ra) < 60 else 2 * (attempt + 1))
-                continue
-            if r.status_code == 404:
-                return None
-            r.raise_for_status()
-            body = r.json()
-            if cache:
-                ck.write_text(json.dumps({"url": url, "params": {k: v for k, v in params.items() if k != "api_key"},
-                                          "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "body": body},
-                                         ensure_ascii=False), encoding="utf-8")
-            return body
-        raise RuntimeError(f"HTTP 재시도 초과: {url} (마지막 상태 {r.status_code}: {r.text[:200]})")
+        r = self.request(url, params, headers, min_interval, retries)
+        if r is None:
+            return None
+        body = r.json()
+        if cache:
+            ck.write_text(json.dumps({"url": url, "params": {k: v for k, v in params.items() if k != "api_key"},
+                                      "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "body": body},
+                                     ensure_ascii=False), encoding="utf-8")
+        return body

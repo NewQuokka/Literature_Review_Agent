@@ -13,6 +13,9 @@
 !/requirements.txt
 !/CLAUDE.md
 
+# 배포 대상 — 소개 영상
+!/Literature_Review_Agent_소개영상.mp4
+
 # 배포 대상 — 에이전트 Skill(절차서·도구·참고 형식)만 허용
 !/.claude/
 /.claude/*

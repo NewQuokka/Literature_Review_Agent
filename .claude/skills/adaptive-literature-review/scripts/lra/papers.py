@@ -7,7 +7,8 @@ import re
 import unicodedata
 
 from . import db
-from .sources import Crossref, norm_doi
+from .config import INTEGRITY_MAX_AGE
+from .sources import Crossref, OpenAlex, norm_doi
 
 PREPRINT_TYPES = {"preprint", "posted-content"}
 
@@ -271,31 +272,46 @@ def crossref_verify(con, cr: Crossref, pid: str) -> dict:
 _STATUS_RANK = {"RETRACTED": 4, "EXPRESSION_OF_CONCERN": 3, "CORRECTED": 2, "NO_KNOWN_ALERT": 1, "UNKNOWN": 0}
 
 
-def integrity_check(con, cr: Crossref, pid: str) -> dict:
+def integrity_check(con, cr: Crossref, pid: str, oa: OpenAlex | None = None) -> dict:
     """Crossref updated-by(+Retraction Watch), updates 필터, OpenAlex is_retracted를 종합.
-    NO_KNOWN_ALERT는 '알려진 경고 없음'일 뿐 철회가 없다는 보증이 아니다."""
+    NO_KNOWN_ALERT는 '알려진 경고 없음'일 뿐 철회가 없다는 보증이 아니다.
+    철회 공지는 첫 조회 뒤에 나올 수 있으므로 검색 캐시와 달리 INTEGRITY_MAX_AGE 안의 응답만 쓴다."""
     p = con.execute("SELECT * FROM papers WHERE paper_id=?", (pid,)).fetchone()
     alerts, sources = [], []
     status = "UNKNOWN"
+    if oa is not None and p["openalex_id"]:
+        try:
+            w = oa.work(p["openalex_id"], max_age=INTEGRITY_MAX_AGE)
+            if w is not None:
+                flag = 1 if w.get("is_retracted") else 0
+                if flag != p["is_retracted_openalex"]:
+                    con.execute("UPDATE papers SET is_retracted_openalex=? WHERE paper_id=?", (flag, pid))
+                    p = con.execute("SELECT * FROM papers WHERE paper_id=?", (pid,)).fetchone()
+        except Exception as e:  # 갱신 실패 시 저장된 값으로 계속
+            alerts.append({"type": "check_error", "detail": "openalex: " + str(e)[:200]})
     if p["is_retracted_openalex"]:
         alerts.append({"type": "retraction", "source": "openalex.is_retracted"})
     if p["doi"]:
         try:
-            m = cr.work(p["doi"]) or {}
+            m = cr.work(p["doi"], max_age=INTEGRITY_MAX_AGE) or {}
             sources.append("crossref.updated-by")
             for u in m.get("updated-by") or []:
                 alerts.append({"type": u.get("type"), "notice_doi": u.get("DOI"), "source": u.get("source"),
                                "date": ((u.get("updated") or {}).get("date-time"))})
-            for n in cr.notices_updating(p["doi"]):
+            for n in cr.notices_updating(p["doi"], max_age=INTEGRITY_MAX_AGE):
                 for u in n.get("update-to") or []:
                     if norm_doi(u.get("DOI")) == p["doi"]:
                         alerts.append({"type": u.get("type"), "notice_doi": n.get("DOI"), "source": "crossref.updates"})
             sources.append("crossref.updates")
             rel = m.get("relation") or {}
+            note = p["version_note"] or ""
             for k in ("has-preprint", "is-preprint-of", "has-version", "is-version-of"):
                 if rel.get(k):
-                    con.execute("UPDATE papers SET version_note=COALESCE(version_note,'') || ? WHERE paper_id=?",
-                                (f" {k}:" + ",".join(x.get("id", "") for x in rel[k]), pid))
+                    item = f" {k}:" + ",".join(x.get("id", "") for x in rel[k])
+                    if item not in note:  # 재점검 시 같은 항목이 중복 누적되지 않게
+                        note += item
+            if note != (p["version_note"] or ""):
+                con.execute("UPDATE papers SET version_note=? WHERE paper_id=?", (note, pid))
             status = "NO_KNOWN_ALERT"
         except Exception as e:  # 네트워크 오류 등 → UNKNOWN 유지
             alerts.append({"type": "check_error", "detail": str(e)[:200]})

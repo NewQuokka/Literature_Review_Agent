@@ -260,6 +260,12 @@ def fulltext_status(con, paper_id: str) -> str:
     return r[0] if r else "NOT_CHECKED"
 
 
+def integrity_checked_at(con, paper_id: str) -> str | None:
+    r = con.execute("SELECT checked_at FROM publication_updates WHERE paper_id=? ORDER BY id DESC LIMIT 1",
+                    (paper_id,)).fetchone()
+    return r[0] if r else None
+
+
 def integrity_status(con, paper_id: str) -> str:
     r = con.execute("SELECT status FROM publication_updates WHERE paper_id=? ORDER BY id DESC LIMIT 1",
                     (paper_id,)).fetchone()

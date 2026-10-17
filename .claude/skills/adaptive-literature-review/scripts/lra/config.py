@@ -12,6 +12,8 @@ import requests
 USER_AGENT = "adaptive-literature-review/0.1 (research support tool; python-requests)"
 QUOTE_MAX_WORDS = 40          # 직접 인용 상한(저작권상 짧은 발췌)
 CORE_TARGET = 20              # 합의된 Core 목표치(의무 아님)
+INTEGRITY_MAX_AGE = 24 * 3600  # 정정·철회 조회 캐시 유효기간(초). 철회 공지는 사후에 나오므로 짧게 둔다
+INTEGRITY_STALE_DAYS = 30     # 마지막 정정·철회 점검이 이보다 오래되면 V14 WARN
 
 
 class Paths:
@@ -68,10 +70,13 @@ class Http:
         return self.paths.cache / f"{h}.json"
 
     def get_json(self, url: str, params: dict | None = None, headers: dict | None = None,
-                 min_interval: float = 0.0, cache: bool = True, retries: int = 3):
+                 min_interval: float = 0.0, cache: bool = True, retries: int = 3,
+                 max_age: float | None = None):
+        """max_age(초): 캐시가 이보다 오래됐으면 다시 받는다. None이면 만료 없음."""
         params = dict(params or {})
         ck = self._key(url, params)
-        if self.use_cache and cache and ck.exists():
+        if (self.use_cache and cache and ck.exists()
+                and (max_age is None or time.time() - ck.stat().st_mtime <= max_age)):
             return json.loads(ck.read_text(encoding="utf-8"))["body"]
         host = url.split("/")[2]
         for attempt in range(retries):

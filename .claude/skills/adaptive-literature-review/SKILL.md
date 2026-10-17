@@ -31,7 +31,7 @@ description: 적응형 선행연구 조사·종합분석 에이전트(v1.3). 검
 - 의존성: Python 3.10+, `requests`, `pymupdf`(설치돼 있지 않으면 사용자에게 설치 승인을 받는다).
 - **OpenAlex 예산:** 키가 없으면 같은 IP가 하루 $0.10(목록 조회 약 100회)을 공유한다. 단건 조회(`/works/W…`, `/sources/S…`)는 무료. 20편 1회 실행에 목록 조회 약 25~45회가 든다. 키가 있으면 `state/config.json`에 `{"openalex_api_key": "..."}` 또는 환경변수 `OPENALEX_API_KEY`. **에이전트가 사용자 이메일로 키를 대신 신청하지 않는다** — 필요하면 https://openalex.org/settings/api 안내.
 - 선택: `LRA_MAILTO`(Crossref polite pool), `S2_API_KEY`. 사용자가 명시적으로 제공한 경우에만 설정한다.
-- 응답은 `state/cache/`에 캐시된다(캐시 적중은 호출·비용 0으로 기록). 최신화가 필요하면 `$LRA --no-cache …`.
+- 응답은 `state/cache/`에 캐시된다(캐시 적중은 호출·비용 0으로 기록). 최신화가 필요하면 `$LRA --no-cache …`. 단, `integrity`(정정·철회)는 철회 공지가 사후에 나올 수 있어 하루 지난 캐시는 다시 조회하며, 마지막 점검이 30일을 넘으면 V14가 WARN이다.
 - 매 실행 결과의 `openalex_budget_remaining_usd`를 보고 0.01 미만이면 멈추고 사용자에게 알린다.
 - v1.1·v1.2에서 만든 기존 프로젝트: 첫 실행 시 DB가 자동 이전된다. v1.1 프로젝트는 `$LRA refresh`(무료)로 기존 문헌의 출처 ID를 채운다.
 - **KCI(2차 기능):** 한국연구재단 KCI Open API 인증키를 사용자가 발급받아 환경변수 `KCI_API_KEY` 또는 `state/config.json`의 `kci_api_key`에 넣는다(에이전트가 대신 신청하지 않음). 넣은 뒤 `$LRA kci probe --title "<짧은 한글 제목어>"`로 실측 → `state/kci_probe.json`에 실제 응답 필드·제목 필수 여부·참고문헌 API 형태가 기록되고, `verified: true`일 때만 KCI 검색이 열린다.

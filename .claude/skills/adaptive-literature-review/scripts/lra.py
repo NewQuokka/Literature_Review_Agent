@@ -22,7 +22,7 @@ except Exception:
 
 from lra import db, papers as P, fulltext as FT, render as R, verify as V  # noqa: E402
 from lra.config import Http, Paths, load_config, QUOTE_MAX_WORDS  # noqa: E402
-from lra.sources import Crossref, OpenAlex, SemanticScholar, oa_to_record, norm_doi  # noqa: E402
+from lra.sources import Crossref, OpenAlex, SemanticScholar, oa_to_record, norm_doi, search_value  # noqa: E402
 
 
 def out(obj):
@@ -265,11 +265,15 @@ def cmd_expand(a):
         if not refs:
             w = oa.work(p["openalex_id"]) or {}
             refs = [x.split("/")[-1] for x in w.get("referenced_works") or []]
-        flt = ",".join(x for x in (f"title_and_abstract.search:{a.query}" if a.query else "", excl) if x)
+        flt = ",".join(x for x in (f"title_and_abstract.search:{search_value(a.query)}" if a.query else "", excl) if x)
         results = oa.works_by_ids(refs, flt) if refs else []
         total = len(refs)
-        results.sort(key=lambda w: -(w.get("cited_by_count") or 0))
-        results = results[:a.limit]
+        if len(results) > a.limit:
+            # 인용수로 자르면 인용이 적은 최신·국내 연구부터 빠진다(규칙 7). 결정적 순서로 자르고 기록한다(#10)
+            n = len(results)
+            results.sort(key=lambda w: (-(w.get("publication_year") or 0), w.get("id") or ""))
+            results = results[:a.limit]
+            excl = "; ".join(x for x in (excl, f"절단: 연도 내림차순 상위 {a.limit}/{n}편") if x)
     elif a.direction == "forward":
         body = oa.citing(p["openalex_id"], a.query or "", a.limit, excl)
         results = (body or {}).get("results", [])
@@ -893,6 +897,31 @@ def cmd_kci(a):
     out(probe)
 
 
+def _kci_years(flt: str | None) -> tuple[str | None, str | None]:
+    """OpenAlex식 연도 필터 → KCI dateFrom/dateTo(YYYYMM).
+    2010-2020, 2010-, -2020, >2009, <2021, 2015를 받는다. KCI가 처리할 수 없는 조건은 조용히 버리지 않고 오류(#10)."""
+    if not flt:
+        return None, None
+    dfrom = dto = None
+    for clause in (c.strip() for c in flt.split(",") if c.strip()):
+        m = re.fullmatch(r"publication_year:(?:(\d{4})?-(\d{4})?|([<>])(\d{4})|(\d{4}))", clause)
+        if not m or not any(m.groups()):
+            raise SystemExit(f"KCI 검색에서 해석할 수 없는 필터: {clause!r}. "
+                             "KCI에는 publication_year(2010-2020, >2009, <2021, 2015)만 적용됩니다.")
+        lo, hi, op, y, one = m.groups()
+        if one:
+            lo = hi = one
+        elif op == ">":
+            lo = str(int(y) + 1)
+        elif op == "<":
+            hi = str(int(y) - 1)
+        if lo:
+            dfrom = f"{lo}01"
+        if hi:
+            dto = f"{hi}12"
+    return dfrom, dto
+
+
 def _kci_search(a, paths, con, cfg, http):
     from lra.sources import KCI, KCIError, kci_to_record
     ok, why = _kci_ready(paths, cfg)
@@ -916,12 +945,7 @@ def _kci_search(a, paths, con, cfg, http):
             raise SystemExit("KCI 우선 학술지가 없습니다. `source add-kci --name ...`으로 먼저 등록하세요.")
         journals = [r["source_name"] for r in rows]
         stage = "A"
-    dfrom = dto = None
-    if a.filter:
-        m = re.search(r"publication_year:(\d{4})?-?(\d{4})?", a.filter)
-        if m:
-            dfrom = f"{m.group(1)}01" if m.group(1) else None
-            dto = f"{m.group(2)}12" if m.group(2) else None
+    dfrom, dto = _kci_years(a.filter)
     results, total_sum = [], 0
     try:
         for jn in journals:

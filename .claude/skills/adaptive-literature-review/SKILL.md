@@ -96,6 +96,7 @@ $LRA search --query "<검색식>" --purpose theory --sources preferred --limit 2
   $LRA search --db kci --query "R&D 지원 효과" --purpose independent                       # Stage C: 학술지 제한 없음
   ```
   `--kci-field keyword|abstract`는 실측에서 제목 없는 검색이 지원된 경우에만 쓸 수 있다. 결과에 `review_duplicate`가 있으면 A6의 중복 검토 대상이다.
+  KCI에는 `--filter`의 연도 조건(`publication_year:2010-2020`, `>2009`, `<2021`, `2015`)만 적용되며, 다른 조건이 섞이면 도구가 거부한다(조용히 버리지 않음).
 
 ### A4. Seed 3편 선정 (F02·F06·F11)
 - 역할별 1편: Theory(핵심 이론의 원전 또는 대표 정립 연구) / Methodology(본 연구가 쓰거나 비교할 방법의 대표 적용·방법론 논문) / Empirical(대상·맥락이 가장 가까운 실증연구).
@@ -116,6 +117,7 @@ $LRA expand --paper P-004 --direction related --limit 20             # 의미 �
 ```
 - `expand`는 항상 Stage B이며 출처 필터를 걸 수 없다(도구가 거부). 분야 밖 방법론 원전·고전·학회논문·공개 연구문헌도 개별 적합성으로 검토한다.
 - 확장 결과가 지나치게 넓으면 `--query`로 좁히고, 부족하면 새 Core 후보에서 1회 더 expand.
+- backward 결과가 `--limit`보다 많으면 인용수가 아니라 발행연도 내림차순으로 자르고, 자른 사실을 04 검색 기록(기타 필터)에 남긴다. 많이 잘렸으면 `--query`로 관련성 필터를 먼저 건다.
 
 ### A6. Stage C — 독립·광역 검증 (F03·F04) — **Core 수량이 차도 최소 1회 필수**
 ```bash

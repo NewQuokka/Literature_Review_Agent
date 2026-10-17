@@ -189,24 +189,30 @@ def run(con, paths: Paths) -> tuple[str, dict]:
         "; ".join(v13) or "모든 원문이 OA 위치 또는 사용자 제공. out/에 원문 없음. 외부 전송은 검색식·DOI만(구조상).")
 
     # V14 출판상태 — 오래된 점검은 그 뒤 나온 철회 공지를 반영하지 못하므로 WARN
-    alerts, unchecked, stale, checked = [], [], [], []
+    # UNKNOWN(조회 실패·DOI 없음·Crossref 미등록)은 확인하지 못한 것이므로 PASS로 두지 않는다(#6)
+    alerts, unchecked, unknown, follow, stale, checked = [], [], [], [], [], []
     limit = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - INTEGRITY_STALE_DAYS * 86400))
     for r in core:
-        s = db.integrity_status(con, r["paper_id"])
-        if s == "NOT_CHECKED":
+        row = db.integrity_latest(con, r["paper_id"])
+        if row is None:
             unchecked.append(r["paper_id"])
             continue
+        s, at, fu = row["status"], row["checked_at"] or "", row["follow_up_required"]
         if s in ("RETRACTED", "EXPRESSION_OF_CONCERN", "CORRECTED"):
             alerts.append(f"{r['paper_id']}:{s}")
-        at = db.integrity_checked_at(con, r["paper_id"]) or ""
+        elif s == "UNKNOWN":
+            unknown.append(r["paper_id"])
+        if fu:
+            follow.append(r["paper_id"])
         checked.append(at)
         if at < limit:
             stale.append(r["paper_id"])
     retracted_in_core = [a for a in alerts if "RETRACTED" in a]
     last = f"마지막 점검 {min(checked)} ~ {max(checked)}" if checked else "점검 기록 없음"
-    add("V14", "정정·철회 점검", "FAIL" if retracted_in_core else ("WARN" if unchecked or alerts or stale else "PASS"),
-        f"경고 {alerts}; 미점검 {unchecked}; {INTEGRITY_STALE_DAYS}일 초과 점검 {stale}; {last}. "
-        "NO_KNOWN_ALERT는 철회 없음의 보증이 아님.")
+    add("V14", "정정·철회 점검",
+        "FAIL" if retracted_in_core else ("WARN" if unchecked or alerts or unknown or stale else "PASS"),
+        f"경고 {alerts}; 조회 실패(UNKNOWN) {unknown}; 후속 확인 필요 {follow}; 미점검 {unchecked}; "
+        f"{INTEGRITY_STALE_DAYS}일 초과 점검 {stale}; {last}. NO_KNOWN_ALERT는 철회 없음의 보증이 아님.")
 
     # V15 형식·완결성 + 허구 ID/DOI 탐지
     missing = [f for f in REQUIRED if not (paths.out / f).exists()]

@@ -24,6 +24,11 @@ except ImportError:  # 구버전
 
 MIN_PDF_BYTES = 8_000
 TITLE_MATCH_MIN = 0.6
+TITLE_MATCH_LINK = 0.8        # 사용자 PDF를 제목만으로 자동 연결할 때의 기준
+QUOTE_MIN_TOKENS = 4          # 직접 인용 대조에 필요한 최소 어절 수(#3)
+QUOTE_MIN_SEGMENT_TOKENS = 2  # 생략부호로 나눈 각 구간의 최소 어절 수
+QUOTE_MIN_CJK_CHARS = 8       # 띄어쓰기 없는 한자·가나 인용의 최소 글자 수
+QUOTE_MAX_GAP = 1500          # 생략부호 구간 사이에 허용하는 최대 간격(정규화 글자 수)
 
 
 def sha256(path: Path) -> str:
@@ -62,12 +67,63 @@ def extract_docx(path: Path) -> str:
     return html.unescape(text)
 
 
-def title_match_score(text: str, title: str) -> float:
-    words = [w for w in norm_title(title).split() if len(w) > 3]
-    if not words:
-        return 1.0
-    t = norm_title(text)
-    return sum(1 for w in words if w in t) / len(words)
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7a3]")
+_STOPWORDS = {"the", "and", "for", "with", "from", "into", "of", "in", "on", "to", "by", "at", "as", "or", "an",
+              "its", "their", "between", "under", "over", "via", "how", "what", "why", "does", "do", "is", "are"}
+_DOI_RE = re.compile(r"10\.\d{4,9}/[^\s\"<>]+")
+
+
+def title_match_score(text: str, title: str) -> float | None:
+    """원문 앞부분과 서지 제목의 일치도(0~1). 판정할 근거가 부족하면 None — 자동 연결에 쓰지 않는다(#5).
+    한글·한자·가나가 든 제목은 띄어쓰기를 뺀 음절 2-gram, 그 밖은 단어 경계를 지킨 내용어로 대조한다."""
+    nt = norm_title(title)
+    tx = norm_title(re.sub(r"-\s*\n\s*", "", text or ""))   # 줄 끝 하이픈 분철 복원
+    if not nt:
+        return None
+    if _CJK_RE.search(nt):
+        a, b = nt.replace(" ", ""), tx.replace(" ", "")
+        grams = {a[i:i + 2] for i in range(len(a) - 1)}
+        if len(grams) < 3:
+            return None
+        have = {b[i:i + 2] for i in range(len(b) - 1)}
+        return len(grams & have) / len(grams)
+    words = [w for w in nt.split() if len(w) >= 3 and w not in _STOPWORDS]
+    if len(words) < 2:
+        return None
+    tokens = set(tx.split())
+    return sum(1 for w in words if w in tokens) / len(words)
+
+
+def find_dois(text: str) -> list[str]:
+    """본문에서 찾은 DOI(소문자, 나온 순서, 중복 제거)."""
+    out = []
+    for d in _DOI_RE.findall(text or ""):
+        d = d.lower().rstrip(".);,")
+        if d not in out:
+            out.append(d)
+    return out
+
+
+def identity_check(page1: str, first: str, title: str, doi: str | None) -> tuple[float | None, str | None]:
+    """내려받은 PDF가 그 논문인지 판정. (제목 일치도, 거부 사유 또는 None)."""
+    score = title_match_score(first, title)
+    p1 = find_dois(page1)
+    own_on_p1 = bool(doi) and doi in p1
+    if score is None:
+        if own_on_p1 and len(p1) <= 2:
+            return None, None
+        return None, "제목으로 판정 불가(제목이 너무 짧음)이고 1쪽에서 이 논문의 DOI도 확인되지 않음"
+    if score < TITLE_MATCH_MIN:
+        return score, f"제목 불일치({score:.2f})"
+    if doi and p1 and not own_on_p1 and score < TITLE_MATCH_LINK:
+        return score, f"1쪽 DOI({', '.join(p1[:3])})가 이 논문의 DOI와 다르고 제목 일치도도 낮음({score:.2f})"
+    return score, None
+
+
+def pid_from_filename(name: str) -> str | None:
+    """파일명의 P-ID(대소문자 무관, P-7·P007·p-007 모두 P-007)."""
+    m = re.search(r"(?<![A-Za-z])[Pp]-?(\d{1,6})(?!\d)", name)
+    return f"P-{int(m.group(1)):03d}" if m else None
 
 
 def candidate_urls(p, s2=None) -> list[dict]:
@@ -141,17 +197,17 @@ def acquire(con, paths: Paths, http_session, pid: str, s2=None) -> dict:
             tmp.write_bytes(data)
             try:
                 doc = pymupdf.open(str(tmp))
-                first = "".join(doc[i].get_text("text") for i in range(min(2, len(doc))))
+                pages = [doc[i].get_text("text") for i in range(min(2, len(doc)))]
                 npages = len(doc)
                 doc.close()
             except Exception as e:
                 a["result"] = f"PDF 열기 실패: {e}"
                 attempts.append(a)
                 continue
-            score = title_match_score(first, p["title"] or "")
-            a["title_match"] = round(score, 2)
-            if score < TITLE_MATCH_MIN:
-                a["result"] = f"제목 불일치(다른 문서 의심, 격리: state/quarantine/{pid}.pdf)"
+            score, why = identity_check(pages[0] if pages else "", "".join(pages), p["title"] or "", p["doi"])
+            a["title_match"] = round(score, 2) if score is not None else None
+            if why:
+                a["result"] = f"{why} — 다른 문서 의심, 격리: state/quarantine/{pid}.pdf"
                 attempts.append(a)
                 continue
             dest = paths.library / tier_dir / f"{safe_name(p)}.pdf"
@@ -192,29 +248,38 @@ def ingest_user_file(con, paths: Paths, src: Path, pid: str | None) -> dict:
     if src.suffix.lower() != ".pdf":
         raise SystemExit("현재 PDF만 지원합니다.")
     doc = pymupdf.open(str(src))
-    first = "".join(doc[i].get_text("text") for i in range(min(3, len(doc))))
+    pages = [doc[i].get_text("text") for i in range(min(3, len(doc)))]
     npages = len(doc)
     doc.close()
+    first = "".join(pages)
     if not pid:
-        m = re.search(r"P-\d{3,}", src.name)
-        if m:
-            pid = m.group(0)
+        cand = pid_from_filename(src.name)
+        if cand and con.execute("SELECT 1 FROM papers WHERE paper_id=?", (cand,)).fetchone():
+            pid = cand
     if not pid:
-        dois = set(d.lower().rstrip(".);,") for d in re.findall(r"10\.\d{4,9}/[^\s\"<>]+", first))
-        for d in dois:
-            r = con.execute("SELECT paper_id FROM papers WHERE doi=?", (d,)).fetchone()
-            if r:
-                pid = r[0]
+        # 1쪽의 DOI를 우선하고, 없으면 앞 3쪽. DB와 맞는 DOI가 둘 이상이면(인용한 다른 논문일 수 있음) 자동 연결하지 않는다
+        for scope in (pages[:1], pages):
+            hits = []
+            for d in find_dois("".join(scope)):
+                r = con.execute("SELECT paper_id FROM papers WHERE doi=?", (d,)).fetchone()
+                if r and r[0] not in hits:
+                    hits.append(r[0])
+            if len(hits) > 1:
+                raise SystemExit(f"{src.name}: 여러 논문의 DOI가 보입니다({', '.join(hits)}). --paper P-xxx 로 지정하세요.")
+            if hits:
+                pid = hits[0]
                 break
     if not pid:
-        best, best_s = None, 0.0
+        scored = []
         for r in con.execute("""SELECT p.paper_id, p.title FROM papers p JOIN paper_memberships m USING(paper_id)
                                 WHERE m.tier IN ('CORE','EXTENDED')"""):
             s = title_match_score(first, r["title"] or "")
-            if s > best_s:
-                best, best_s = r["paper_id"], s
-        if best_s >= 0.8:
-            pid = best
+            if s is not None and s >= TITLE_MATCH_LINK:
+                scored.append((s, r["paper_id"]))
+        if len(scored) > 1:
+            raise SystemExit(f"{src.name}: 제목이 맞는 후보가 여럿입니다({', '.join(x[1] for x in scored)}). --paper P-xxx 로 지정하세요.")
+        if scored:
+            pid = scored[0][1]
     if not pid:
         raise SystemExit(f"{src.name}: 어떤 P-ID와도 매칭되지 않았습니다. --paper P-xxx 로 지정하세요.")
     p = con.execute("SELECT * FROM papers WHERE paper_id=?", (pid,)).fetchone()
@@ -241,8 +306,12 @@ def ingest_user_file(con, paths: Paths, src: Path, pid: str | None) -> dict:
     # 초록 기반 근거는 재검증 대상으로 표시
     con.execute("""UPDATE evidence SET verification_note=COALESCE(verification_note,'') || ' [원문 확보 → 재검증 필요]'
                    WHERE paper_id=? AND verification_status IN ('ABSTRACT_BASED','METADATA_ONLY','UNVERIFIED')""", (pid,))
-    warn = None if score >= TITLE_MATCH_MIN else f"제목 일치도 낮음({score:.2f}) — 파일이 맞는지 확인 필요"
-    return {"paper_id": pid, "file": str(dest), "pages": npages, "title_match": round(score, 2), "warning": warn}
+    if score is None:
+        warn = "제목이 짧아 일치도를 판정할 수 없음 — 파일이 맞는지 사람이 확인"
+    else:
+        warn = None if score >= TITLE_MATCH_MIN else f"제목 일치도 낮음({score:.2f}) — 파일이 맞는지 확인 필요"
+    return {"paper_id": pid, "file": str(dest), "pages": npages,
+            "title_match": round(score, 2) if score is not None else None, "warning": warn}
 
 
 # ---------- 인용 대조 ----------
@@ -261,8 +330,52 @@ def norm_text(s: str) -> str:
     return s.strip()
 
 
+# 대조할 때 남기는 기호: 수치의 뜻을 바꾸는 것들. 글자는 \w(모든 문자 체계)로 남는다(#3)
+_DROP_RE = re.compile(r"[^\w.,\-+<>=≤≥±%&/×]|_")
+_ELLIPSIS_RE = re.compile(r"\[\s*\.\s?\.\s?\.\s*\]|\.\s?\.\s?\.")
+
+
 def _squash(s: str) -> str:
-    return re.sub(r"[^0-9a-z가-힣]", "", s)
+    """norm_text 결과에서 공백·따옴표·괄호 등 표기 차이만 지운다. 소수점·부호·부등호·% 등은 남긴다."""
+    return _DROP_RE.sub("", s).rstrip(".,").lstrip(",")
+
+
+def _tokens(s: str) -> int:
+    return len(re.findall(r"\w+", s))
+
+
+def quote_segments(quote: str) -> tuple[list[str], str | None]:
+    """직접 인용을 생략부호 기준 구간으로 나눠 정규화한다. (구간들, 대조 불가 사유 또는 None)."""
+    norm = norm_text(quote)
+    parts = [p for p in _ELLIPSIS_RE.split(norm) if _squash(p)]
+    if not parts:
+        return [], "정규화 후 남는 글자가 없음"
+    cjk_only = not re.search(r"\s", norm.strip()) and _CJK_RE.search(norm) and not re.search(r"[가-힣]", norm)
+    if cjk_only:
+        if len(_squash(norm)) < QUOTE_MIN_CJK_CHARS:
+            return [], f"인용문이 너무 짧음({QUOTE_MIN_CJK_CHARS}자 이상 필요)"
+    elif sum(_tokens(p) for p in parts) < QUOTE_MIN_TOKENS:
+        return [], f"인용문이 너무 짧음({QUOTE_MIN_TOKENS}어절 이상 필요)"
+    elif len(parts) > 1 and any(_tokens(p) < QUOTE_MIN_SEGMENT_TOKENS for p in parts):
+        return [], f"생략부호로 나눈 구간이 너무 짧음(구간마다 {QUOTE_MIN_SEGMENT_TOKENS}어절 이상 필요)"
+    return [_squash(p) for p in parts], None
+
+
+def find_segments(text: str, segs: list[str], max_gap: int = QUOTE_MAX_GAP) -> list[tuple[int, int]]:
+    """정규화한 텍스트에서 구간들이 순서대로(간격 max_gap 이내) 나오는 위치 (시작, 끝) 목록."""
+    out, i = [], text.find(segs[0])
+    while i >= 0:
+        pos, ok = i + len(segs[0]), True
+        for s in segs[1:]:
+            j = text.find(s, pos)
+            if j < 0 or j - pos > max_gap:
+                ok = False
+                break
+            pos = j + len(s)
+        if ok:
+            out.append((i, pos))
+        i = text.find(segs[0], i + 1)
+    return out
 
 
 def page_text(paths: Paths, pid: str, page: int) -> str | None:
@@ -271,19 +384,20 @@ def page_text(paths: Paths, pid: str, page: int) -> str | None:
 
 
 def locate_quote(paths: Paths, pid: str, quote: str) -> list[int]:
-    q = _squash(norm_text(quote))
+    """인용문이 있는 PDF 쪽 번호. 쪽 경계에 걸친 인용은 시작 쪽으로 센다. 대조 불가(너무 짧음 등)면 빈 목록."""
+    segs, _ = quote_segments(quote)
     hits = []
     d = paths.text / pid
-    if not d.exists() or not q:
+    if not d.exists() or not segs:
         return hits
     files = sorted(d.glob("p*.txt"))
+    texts = [_squash(norm_text(f.read_text(encoding="utf-8"))) for f in files]
     for i, f in enumerate(files):
-        t = _squash(norm_text(f.read_text(encoding="utf-8")))
-        if q in t:
+        if find_segments(texts[i], segs):
             hits.append(int(f.stem[1:]))
-        elif i + 1 < len(files):  # 쪽 경계에 걸친 인용
-            t2 = t[-len(q) * 2:] + _squash(norm_text(files[i + 1].read_text(encoding="utf-8")))[:len(q) * 2]
-            if q in t2:
+        elif i + 1 < len(files):  # 쪽 경계에 걸친 인용 — 경계를 실제로 가로지르는 일치만
+            joined = texts[i] + texts[i + 1]
+            if any(s < len(texts[i]) < e for s, e in find_segments(joined, segs)):
                 hits.append(int(f.stem[1:]))
     return hits
 
@@ -302,6 +416,9 @@ def verify_evidence_item(con, paths: Paths, ev: dict) -> tuple[str, str]:
                 if t is None:
                     return "CONFLICT", f"p.{page}는 원문 쪽수 범위를 벗어남"
             return "UNVERIFIED", "직접 인용 없이 재서술만 있음 — 위치는 사람이 확인"
+        segs, why = quote_segments(quote)
+        if why:
+            return "UNVERIFIED", f"대조 불가: {why}"
         hits = locate_quote(paths, pid, quote)
         if not hits:
             return "UNVERIFIED", "원문 텍스트에서 인용문을 찾지 못함(추출 오류 또는 부정확한 인용)"
@@ -309,9 +426,12 @@ def verify_evidence_item(con, paths: Paths, ev: dict) -> tuple[str, str]:
             return "VERIFIED_FULLTEXT", f"PDF p.{page}에서 글자 대조 일치"
         if page:
             return "CONFLICT", f"인용문은 PDF p.{','.join(map(str, hits))}에 있으나 기재 쪽은 p.{page}"
-        return "VERIFIED_FULLTEXT", f"PDF p.{','.join(map(str, hits))}에서 발견(쪽 미기재 → 자동 보정)"
+        if len(hits) > 1:
+            return "UNVERIFIED", f"인용문이 여러 쪽(PDF p.{','.join(map(str, hits))})에 있음 — 쪽을 기재해야 확인됨"
+        return "VERIFIED_FULLTEXT", f"PDF p.{hits[0]}에서 발견(쪽 미기재 → 자동 보정)"
     # 원문 미확보
-    if quote and p and p["abstract"] and _squash(norm_text(quote)) in _squash(norm_text(p["abstract"])):
+    segs, why = quote_segments(quote) if quote else ([], None)
+    if segs and p and p["abstract"] and find_segments(_squash(norm_text(p["abstract"])), segs):
         return "ABSTRACT_BASED", "초록에서 일치 확인(원문 쪽수 없음)"
     if quote:
         return "UNVERIFIED", "원문 미확보 상태의 인용문 — 사용 금지, 원문 확보 후 재검증"

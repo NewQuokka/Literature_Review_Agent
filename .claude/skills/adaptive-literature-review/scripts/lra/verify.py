@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import db
 from .config import CORE_TARGET, INTEGRITY_STALE_DAYS, QUOTE_MAX_WORDS, Paths
-from .fulltext import MIN_PDF_BYTES, sha256, verify_evidence_item, page_text
+from .fulltext import MIN_PDF_BYTES, TITLE_MATCH_MIN, sha256, verify_evidence_item, page_text
 from .papers import norm_title
 from .render import member_rows
 
@@ -120,7 +120,7 @@ def run(con, paths: Paths) -> tuple[str, dict]:
         "중요 누락(Recall)은 전문가 정답 대조 필요")
 
     # V06 원문 파일
-    issues, n_full = [], 0
+    issues, undecided, n_full = [], [], 0
     for ft in con.execute("SELECT * FROM fulltexts WHERE access_status IN ('FULL_PDF','FULL_XML')"):
         n_full += 1
         f = Path(ft["file_path"] or "")
@@ -131,14 +131,17 @@ def run(con, paths: Paths) -> tuple[str, dict]:
             issues.append(f"{ft['paper_id']}: 체크섬 불일치")
         if not f.read_bytes()[:4] == b"%PDF" or f.stat().st_size < MIN_PDF_BYTES:
             issues.append(f"{ft['paper_id']}: 유효 PDF 아님")
-        if (ft["title_match"] or 0) < 0.6:
+        if ft["title_match"] is None:
+            undecided.append(ft["paper_id"])
+        elif ft["title_match"] < TITLE_MATCH_MIN:
             issues.append(f"{ft['paper_id']}: 제목 일치도 {ft['title_match']}")
         if ft["paper_id"] not in f.name:
             issues.append(f"{ft['paper_id']}: 파일명-P-ID 불일치")
     tried = con.execute("SELECT COUNT(*) FROM fulltexts").fetchone()[0]
-    add("V06", "원문 확보 정확성", "FAIL" if issues else "PASS",
+    add("V06", "원문 확보 정확성", "FAIL" if issues else ("WARN" if undecided else "PASS"),
         (f"유효 전문 {n_full}편 / 시도 {tried}편 (전문 확보율 {n_full / tried * 100:.0f}%)" if tried else "확보 시도 없음")
-        + (f"; 문제 {issues}" if issues else ""))
+        + (f"; 문제 {issues}" if issues else "")
+        + (f"; 제목 판정 불가(사람 확인) {undecided}" if undecided else ""))
 
     # V07 직접 인용
     v7, long_q, changed = [], [], []

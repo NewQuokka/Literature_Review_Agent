@@ -11,7 +11,13 @@
 !/README.md
 !/LICENSE
 !/requirements.txt
+!/requirements-dev.txt
+!/pytest.ini
 !/CLAUDE.md
+
+# 배포 대상 — 테스트와 CI
+!/tests/
+!/.github/
 
 # 배포 대상 — 소개 영상
 !/Literature_Review_Agent_소개영상.mp4

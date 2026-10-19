@@ -1,20 +1,13 @@
 {
   "permissions": {
     "ask": [
-      "Bash(python .claude/skills/adaptive-literature-review/scripts/lra.py approve:*)",
-      "Bash(python .claude/skills/adaptive-literature-review/scripts/lra.py rank approve:*)",
-      "Bash(python .claude/skills/adaptive-literature-review/scripts/lra.py rank pin:*)",
-      "Bash(python .claude/skills/adaptive-literature-review/scripts/lra.py mode set:*)",
-      "Bash(python .claude/skills/adaptive-literature-review/scripts/lra.py kci probe:*)",
-      "Bash(python .claude/skills/adaptive-literature-review/scripts/lra.py dedup --link:*)",
-      "Bash(python .claude/skills/adaptive-literature-review/scripts/lra.py dedup --unlink:*)",
-      "Bash(python3 .claude/skills/adaptive-literature-review/scripts/lra.py approve:*)",
-      "Bash(python3 .claude/skills/adaptive-literature-review/scripts/lra.py rank approve:*)",
-      "Bash(python3 .claude/skills/adaptive-literature-review/scripts/lra.py rank pin:*)",
-      "Bash(python3 .claude/skills/adaptive-literature-review/scripts/lra.py mode set:*)",
-      "Bash(python3 .claude/skills/adaptive-literature-review/scripts/lra.py kci probe:*)",
-      "Bash(python3 .claude/skills/adaptive-literature-review/scripts/lra.py dedup --link:*)",
-      "Bash(python3 .claude/skills/adaptive-literature-review/scripts/lra.py dedup --unlink:*)"
+      "Bash(python*lra.py* approve*)",
+      "Bash(python*lra.py* rank approve*)",
+      "Bash(python*lra.py* rank pin*)",
+      "Bash(python*lra.py* mode set*)",
+      "Bash(python*lra.py* kci probe*)",
+      "Bash(python*lra.py* dedup --link*)",
+      "Bash(python*lra.py* dedup --unlink*)"
     ]
   }
 }

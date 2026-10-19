@@ -10,7 +10,9 @@ from pathlib import Path
 
 import requests
 
-USER_AGENT = "adaptive-literature-review/0.1 (research support tool; python-requests)"
+from . import __version__
+
+USER_AGENT = f"adaptive-literature-review/{__version__} (research support tool; python-requests)"
 QUOTE_MAX_WORDS = 40          # 직접 인용 상한(저작권상 짧은 발췌)
 CORE_TARGET = 20              # 합의된 Core 목표치(의무 아님)
 EVIDENCE_TYPES = ("concept", "theory", "method", "finding", "statistic", "result", "limitation", "definition")
@@ -60,7 +62,14 @@ class HttpError(RuntimeError):
 def load_config(paths: Paths) -> dict:
     cfg = {}
     if paths.config.exists():
-        cfg = json.loads(paths.config.read_text(encoding="utf-8"))
+        raw = paths.config.read_bytes()
+        if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):   # PowerShell 5.1의 `>`는 UTF-16으로 쓴다(#13)
+            raise SystemExit(f"{paths.config}가 UTF-16으로 저장되어 있습니다. 메모장에서 'UTF-8'로 다시 저장하거나 "
+                             "PowerShell에서 `Set-Content -Encoding UTF8`로 만드세요.")
+        try:
+            cfg = json.loads(raw.decode("utf-8-sig"))   # BOM이 붙은 UTF-8도 읽음
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            raise SystemExit(f"{paths.config}를 읽을 수 없습니다(UTF-8 JSON이어야 함): {e}") from None
     # 환경변수가 우선
     for env, key in (("OPENALEX_API_KEY", "openalex_api_key"),
                      ("S2_API_KEY", "s2_api_key"),

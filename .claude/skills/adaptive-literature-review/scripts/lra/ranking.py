@@ -176,13 +176,14 @@ def pin(con, pid: str, rank: int | None, reason: str | None, by: str = "user") -
                             (r["eval_id"],)).fetchone())
 
 
-def approve(con, pids: list[str] | None) -> int:
-    q = "UPDATE paper_rankings SET proposed_or_approved='APPROVED' WHERE is_current=1 AND proposed_or_approved='PROPOSED'"
+def approve(con, pids: list[str] | None, by: str) -> int:
+    q = ("UPDATE paper_rankings SET proposed_or_approved='APPROVED', approved_by=? "
+         "WHERE is_current=1 AND proposed_or_approved='PROPOSED'")
     if pids:
         q += f" AND paper_id IN ({','.join('?' * len(pids))})"
-        n = con.execute(q, pids).rowcount
+        n = con.execute(q, [by, *pids]).rowcount
     else:
-        n = con.execute(q).rowcount
+        n = con.execute(q, [by]).rowcount
     for s in ("CORE", "EXTENDED"):
         recompute(con, s)
     return n

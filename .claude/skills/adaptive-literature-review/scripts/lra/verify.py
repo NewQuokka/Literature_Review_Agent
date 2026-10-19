@@ -93,6 +93,8 @@ def run(con, paths: Paths) -> tuple[str, dict]:
         f"불일치 {len(bad)}건 {bad}; 미점검 {len(unchecked)}건 {unchecked[:10]}; DOI 없음 {len(nodoi)}건 {nodoi} (자동 제외하지 않음)")
 
     # V04 중복
+    from .papers import distinct_pairs, find_version_duplicates
+    distinct = distinct_pairs(con)   # 사람이 '별개 연구'로 판정한 쌍은 중복으로 세지 않음
     dups = []
     seen_doi, seen_t = {}, {}
     for r in core:
@@ -103,13 +105,19 @@ def run(con, paths: Paths) -> tuple[str, dict]:
                 dups.append((seen_doi[r["doi"]], r["paper_id"]))
             seen_doi[r["doi"]] = r["paper_id"]
         t = norm_title(r["title"])
-        if t in seen_t:
+        if t in seen_t and tuple(sorted((seen_t[t], r["paper_id"]))) not in distinct:
             dups.append((seen_t[t], r["paper_id"]))
         seen_t[t] = r["paper_id"]
     linked_in = [r["paper_id"] for r in core if r["canonical_work_id"] and r["canonical_work_id"] in ids]
+    # 유사도 기반 판본 후보·검토 대기 중복이 연결 없이 함께 집합에 있으면 한 연구가 두 자리를 차지한다(#8)
+    versions = [(d["a"], d["b"]) for d in find_version_duplicates(con)
+                if d["a"] in ids and d["b"] in ids and not d["already_linked"] and tuple(sorted((d["a"], d["b"]))) not in distinct]
+    pending = [(r[0], r[1]) for r in con.execute("SELECT a, b FROM duplicate_pairs WHERE status='REVIEW_DUPLICATE'")
+               if r[0] in ids and r[1] in ids]
     n_runs = con.execute("SELECT COUNT(*) FROM search_runs").fetchone()[0]
-    add("V04", "중복·선별 이력", "FAIL" if dups or linked_in else ("PASS" if n_runs else "WARN"),
-        f"중복 의심 {dups}; 대표판과 함께 집합에 남은 판본 {linked_in}; 검색 Run {n_runs}건 기록")
+    add("V04", "중복·선별 이력", "FAIL" if dups or linked_in or versions or pending else ("PASS" if n_runs else "WARN"),
+        f"중복 의심 {dups}; 대표판과 함께 집합에 남은 판본 {linked_in}; 연결되지 않은 판본 후보 {versions} "
+        f"(`dedup --link` 또는 `--distinct`); 검토 대기 중복이 함께 선정됨 {pending}; 검색 Run {n_runs}건 기록")
 
     # 문헌 수
     n_core = sum(1 for r in core if r["tier"] == "CORE")
@@ -387,16 +395,19 @@ def run(con, paths: Paths) -> tuple[str, dict]:
             v17_warn.append("KCI 실측 미통과 — KCI 응답 필드는 '미검증'")
         if not kci_runs:
             v17_warn.append(f"{mode} 모드지만 KCI 검색 기록 없음")
-        rev = con.execute("SELECT COUNT(DISTINCT paper_id) FROM paper_external_ids WHERE match_status='REVIEW_DUPLICATE'").fetchone()[0]
+        rev = con.execute("SELECT COUNT(*) FROM duplicate_pairs WHERE status='REVIEW_DUPLICATE'").fetchone()[0]
         if rev:
             v17_warn.append(f"국내외 중복 검토 대기 {rev}건(dedup --review)")
         for r in con.execute("""SELECT a.paper_id x, b.paper_id y, a.year ya, b.year yb FROM papers a JOIN papers b
                                 ON b.canonical_work_id=a.paper_id WHERE ABS(COALESCE(a.year,0)-COALESCE(b.year,0))>2"""):
             v17_fail.append(f"병합 의심: {r['x']}↔{r['y']} 연도 차 {abs((r['ya'] or 0) - (r['yb'] or 0))}")
         if mode == "KCI":
-            mixed = [r["paper_id"] for r in core if r["tier"] == "CORE" and (r["db_origin"] or "OPENALEX") == "OPENALEX"]
-            if mixed:
-                v17_warn.append(f"KCI 모드 Core에 해외 DB 문헌 {mixed} — 사용자 동의 기록 확인")
+            mixed = [r for r in core if r["tier"] == "CORE" and (r["db_origin"] or "OPENALEX") == "OPENALEX"]
+            no_consent = [r["paper_id"] for r in mixed if not (r["consent_note"] or "").strip()]
+            if no_consent:   # 동의 문구가 DB에 저장된 경우만 인정(#7)
+                v17_fail.append(f"KCI 모드 Core에 사용자 동의 기록 없는 해외 DB 문헌 {no_consent}")
+            elif mixed:
+                v17_warn.append(f"KCI 모드 Core에 해외 DB 문헌 {[r['paper_id'] for r in mixed]}(동의 기록 있음 — 03·보고서에 명시)")
         add("V17", "KCI/통합 검색·중복처리", "FAIL" if v17_fail else ("WARN" if v17_warn else "PASS"),
             f"모드 {mode}; KCI Run {kci_runs}; 문제 {v17_fail + v17_warn}. 병합 정확도는 사람 확인 필요")
 

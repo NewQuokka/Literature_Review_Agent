@@ -145,6 +145,13 @@ CREATE TABLE IF NOT EXISTS paper_rankings (
   pinned_rank INTEGER, override_reason TEXT, change_reason TEXT, evaluated_by TEXT,
   is_current INTEGER DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS duplicate_pairs (   -- 중복 판정은 논문 쌍 단위로(#8). a < b
+  a TEXT, b TEXT, confidence REAL,
+  status TEXT,                -- REVIEW_DUPLICATE / DISTINCT / MATCHED(같은 연구로 연결됨)
+  kind TEXT,                  -- cross_db(국내외 제목 유사) / title(DOI 없는 제목 일치, 자동 병합 보류)
+  note TEXT, checked_at TEXT,
+  PRIMARY KEY (a, b)
+);
 CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT, command TEXT, detail TEXT
 );
@@ -168,7 +175,8 @@ MIGRATIONS = {
     "search_runs": [("source_ids", "TEXT"), ("search_stage", "TEXT"), ("scope_expansion_reason", "TEXT"),
                     ("api_calls", "INTEGER"), ("cost_usd", "REAL"), ("search_mode", "TEXT"), ("language", "TEXT")],
     "preferred_sources": [("source_db", "TEXT"), ("kci_index_status", "TEXT")],
-    "paper_memberships": [("outside_reason", "TEXT")],
+    "paper_memberships": [("outside_reason", "TEXT"), ("consent_note", "TEXT")],
+    "paper_rankings": [("approved_by", "TEXT")],
 }
 MODES = ("INTERNATIONAL", "KCI", "INTEGRATED")
 CRITERIA = ("research_fit", "role_contribution", "evidence_quality", "distinctiveness", "time_relevance")
@@ -194,6 +202,13 @@ def connect(path) -> sqlite3.Connection:
             if col not in have:
                 con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_papers_kci ON papers(kci_id) WHERE kci_id IS NOT NULL")
+    # 구버전: 중복 판정이 paper_external_ids.match_status에 있었다 → 쌍 테이블로 옮김(한 번만, 기존 판정 우선)
+    con.execute("""INSERT OR IGNORE INTO duplicate_pairs(a, b, confidence, status, kind, note, checked_at)
+                   SELECT MIN(paper_id, related_paper_id), MAX(paper_id, related_paper_id), match_confidence,
+                          match_status, 'cross_db', note, checked_at
+                   FROM paper_external_ids WHERE match_status IN ('REVIEW_DUPLICATE', 'DISTINCT')
+                   AND related_paper_id IS NOT NULL AND related_paper_id != paper_id""")
+    con.commit()   # 연결 직후 쓰기 잠금을 남기지 않음
     if not con.execute("SELECT 1 FROM ranking_weights").fetchone():
         con.execute("INSERT INTO ranking_weights VALUES ('W1', ?, '초기 제안(파일럿으로 조정)', 'default', ?)",
                     (json.dumps(DEFAULT_WEIGHTS), now()))
@@ -239,18 +254,26 @@ def log_event(con, command: str, detail) -> None:
 
 
 def set_membership(con, paper_id: str, tier: str, status: str, reason: str = "",
-                   review_by: str = "agent", outside_reason: str | None = None) -> None:
+                   review_by: str = "agent", outside_reason: str | None = None, consent_note: str | None = None) -> None:
     pid = project_id(con)
     ver = current_version(con)
     con.execute("""INSERT INTO paper_memberships(project_id, paper_id, tier, status, reason, selected_at, review_by, version_id,
-                   outside_reason) VALUES (?,?,?,?,?,?,?,?,?)
+                   outside_reason, consent_note) VALUES (?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(project_id, paper_id) DO UPDATE SET tier=excluded.tier, status=excluded.status,
                    reason=excluded.reason, selected_at=excluded.selected_at, review_by=excluded.review_by,
                    version_id=excluded.version_id,
-                   outside_reason=COALESCE(excluded.outside_reason, paper_memberships.outside_reason)""",
-                (pid, paper_id, tier, status, reason, now(), review_by, ver, outside_reason))
+                   outside_reason=COALESCE(excluded.outside_reason, paper_memberships.outside_reason),
+                   consent_note=COALESCE(excluded.consent_note, paper_memberships.consent_note)""",
+                (pid, paper_id, tier, status, reason, now(), review_by, ver, outside_reason, consent_note))
     con.execute("INSERT INTO membership_history(paper_id, tier, status, reason, changed_at, version_id) VALUES (?,?,?,?,?,?)",
                 (paper_id, tier, status, reason, now(), ver))
+
+
+def pending_duplicates(con, paper_id: str) -> list[str]:
+    """사람 확인을 기다리는 중복 후보(REVIEW_DUPLICATE) 상대 P-ID 목록."""
+    return [r[0] for r in con.execute("""SELECT CASE WHEN a=? THEN b ELSE a END FROM duplicate_pairs
+                                         WHERE (a=? OR b=?) AND status='REVIEW_DUPLICATE' ORDER BY 1""",
+                                      (paper_id, paper_id, paper_id))]
 
 
 def membership(con, paper_id: str):

@@ -21,7 +21,8 @@ description: 적응형 선행연구 조사·종합분석 에이전트(v1.3). 검
 10. **승인 기록은 사용자 발화가 있을 때만.** `approve`·`source approve`는 사용자가 채팅에서 승인한 것에만 실행한다. 사용자가 "알아서 진행"을 요청한 데모에서는 `--provisional`로 **임시선정**임을 표시하고 보고서에도 밝힌다.
 11. **연구공백은 가설.** "그런 연구는 없다"가 아니라 "본 검토 범위에서 확인되지 않음"으로 쓴다. Systematic Review를 수행했다고 표현하지 않는다.
 12. **중요도 순위는 이 연구계획 버전의 상대적 활용 우선순위다.** 학술지·논문의 절대 서열이나 품질 확정값으로 표현하지 않는다. 인용수·학술지 지표·KCI 등재 상태는 점수 근거로 쓰지 않고 보조 표시만 한다. 중요도(Importance)·품질 검토(Quality)·근거 검증(Verification)은 서로 다른 필드다. 근거 없는 기준에 점수를 채우지 않는다(→ `평가보류`). 사용자 확인 없이 승인된 순위를 바꾸지 않는다.
-13. **KCI는 실측 전 사용 금지.** KCI 응답 필드·검색 조건은 `kci probe`로 실제 확인되기 전에는 지원된다고 가정하지 않는다(도구가 차단). KCI **학술지 인용지수를 논문 인용수로 쓰지 않으며**, KCI·해외 DB 인용수를 비교·합산하지 않는다. KCI 모드에서는 사용자 동의 없이 해외 문헌을 Core에 섞지 않는다(도구가 차단). 통합 모드의 국내외 비중은 고정하지 않는다(예: 10:10 금지). 번역 제목만 비슷한 논문은 자동 병합하지 않는다(`REVIEW_DUPLICATE` → 사람 확인).
+13. **KCI는 실측 전 사용 금지.** KCI 응답 필드·검색 조건은 `kci probe`로 실제 확인되기 전에는 지원된다고 가정하지 않는다(도구가 `state/kci_probe.json`을 보고 차단하지만, 이 파일은 에이전트가 쓸 수 있는 위치이므로 **절차로 지킨다** — 직접 만들거나 고치지 않는다). KCI **학술지 인용지수를 논문 인용수로 쓰지 않으며**, KCI·해외 DB 인용수를 비교·합산하지 않는다. KCI 모드에서는 사용자 동의 없이 해외 문헌을 Core에 섞지 않는다(`select`·`seed set`이 `--user-consented-mix "동의 내용"` 없이는 거부하고, 동의 문구는 DB에 저장되며 V17이 확인한다). 통합 모드의 국내외 비중은 고정하지 않는다(예: 10:10 금지). 번역 제목만 비슷한 논문은 자동 병합하지 않는다(`REVIEW_DUPLICATE` → 사람 확인). DOI 없는 레코드는 같은 언어의 원제목과 첫 저자가 모두 같을 때만 자동으로 합친다. 중복 판정은 쌍 단위로 저장되어 재수집해도 지워지지 않는다.
+14. **사람이 내릴 결정은 사람에게 묻는다.** `approve`·`rank approve`·`rank pin`·`mode set`·`kci probe`·`dedup --link/--unlink`는 프로젝트 `.claude/settings.json`의 권한 설정으로 실행 전에 사용자 확인 창이 뜬다. `approve`는 `--by`가 필수이고, `--by user`면 사용자가 한 말을 `--evidence "..."`로 그대로 남긴다. 사용자가 승인하지 않았으면 `--by agent`로 기록한다(임시선정 Seed 표시는 사용자 승인으로만 풀린다).
 
 ## 1. 준비
 
@@ -71,7 +72,7 @@ $LRA register-raw                   # raw/ 해시 고정 + 텍스트 추출(stat
         --scope-fit "R&D 정책 효과 연구 다수 수록" --reason "이론·실증 핵심 학술지"
    ```
    `source add`는 단건 조회로 ID 실재를 확인한 뒤에만 저장한다(없는 ID는 거부).
-4. 사용자 선호 출처는 `--origin user`로 추가, 사용자 제외 요청은 `$LRA source exclude S… --reason "사용자 요청: …" --origin user` → 이후 **모든 Stage 검색에서 자동 제외**된다.
+4. 사용자 선호 출처는 `--origin user`로 추가, 사용자 제외 요청은 `$LRA source exclude S… --reason "사용자 요청: …" --origin user` → 이후 **모든 Stage 검색에서 자동 제외**된다. 제외한 출처는 사용자가 되살리라고 했을 때만 `source add S… --user-restored "사용자 요청 내용"`으로 다시 넣을 수 있다.
 5. **KCI/INTEGRATED 모드의 국내 학술지:** 국내 세부분야별 KCI 학술지를 정해 등록한다. KCI 검색 결과에 같은 학술지명이 실제로 나와야 등록된다(임의 생성 금지). 등재 구분은 KCI 포털에서 확인한 값만 쓰고, 모르면 비워 둔다(`확인 필요`로 표시됨).
    ```bash
    $LRA source add-kci --name "기술혁신연구" --verify-title "혁신" --field "기술경영" --role empirical \
@@ -89,7 +90,7 @@ $LRA search --query "<검색식>" --purpose theory --sources preferred --limit 2
   `$LRA search --query "…" --purpose methodology --stage C --expansion-reason "Stage A 방법론 후보 3건뿐 — 원전이 타 분야 학술지에 있음"`
 - 사용자가 준 기간·언어 조건만 `--filter`로 적용한다(예: `publication_year:2010-2025`, `language:en|ko`).
 - 검토: `$LRA candidates --top 60 --out state/work/candidates.md` (★ = 우선 출처) → 읽고 판단.
-- 결정은 모두 기록: `$LRA screen P-012 P-019 --decision exclude --reason "연구질문과 무관(의료 데이터 공유)"`. '우선 출처 밖' 같은 사유는 도구가 거부한다.
+- 결정은 모두 기록: `$LRA screen P-012 P-019 --decision exclude --category relevance --reason "연구질문과 무관(의료 데이터 공유)"`. 제외(`screen --decision exclude`, `deselect --status REJECTED`)에는 `--category relevance|role|quality|duplicate|other`가 필수이고, '우선 출처 밖'·'주요 학술지 미수록' 같은 출처 기반 사유는 도구가 거부한다.
 - **KCI 검색(KCI/INTEGRATED, 실측 통과 후):**
   ```bash
   $LRA search --db kci --query "연구개발 보조금" --purpose empirical --sources preferred   # Stage A: 등록한 KCI 학술지별 조회
@@ -101,12 +102,12 @@ $LRA search --query "<검색식>" --purpose theory --sources preferred --limit 2
 ### A4. Seed 3편 선정 (F02·F06·F11)
 - 역할별 1편: Theory(핵심 이론의 원전 또는 대표 정립 연구) / Methodology(본 연구가 쓰거나 비교할 방법의 대표 적용·방법론 논문) / Empirical(대상·맥락이 가장 가까운 실증연구).
 - 기준 순서: 연구질문 관련성 → 역할 대표성 → 연구설계의 적절성 → (보조) 인용망 중심성. 인용수·출처 권위 단독 기준 금지. Stage A 후보가 부적합하면 Stage C 후보에서 고를 수 있다(사유 기록).
-- 판본 중복 먼저 확인: `$LRA dedup` → 같은 연구면 `$LRA dedup --link <출판본> <프리프린트> --note "..."`.
+- 판본 중복 먼저 확인: `$LRA dedup` → 같은 연구면 `$LRA dedup --link <출판본> <프리프린트> --note "..."`, 다른 연구면 `$LRA dedup --distinct A B --note "..."`. 잘못 연결했으면 `$LRA dedup --unlink <판본>`. 연결되지 않은 판본 후보가 Core·Extended에 함께 있으면 V04가 FAIL이다.
 ```bash
-$LRA seed set --role theory --paper P-004 --reason "..." --alternatives P-011,P-020 [--provisional]
+$LRA seed set --role theory --paper P-004 --reason "..." --alternatives P-011,P-020 [--provisional] [--user-consented-mix "..."]
 ```
 - 적합한 후보가 없으면 지정하지 않는다 → 02에 `없음/추가 탐색 필요`.
-- `$LRA render 02` 후 **사용자 승인 지점 ①**: Seed 3편과 대안을 보여주고 승인·교체를 받는다. 승인되면 `$LRA approve P-004 P-009 P-015 --by user`. 교체는 `seed reject` + 새 `seed set`.
+- `$LRA render 02` 후 **사용자 승인 지점 ①**: Seed 3편과 대안을 보여주고 승인·교체를 받는다. 승인되면 `$LRA approve P-004 P-009 P-015 --by user --evidence "<사용자가 한 승인 발화 그대로>"`. 교체는 `seed reject` + 새 `seed set`.
 
 ### A5. Stage B — 출처 제한 없는 인용망·의미 확장 (F03) — **필수**
 각 Seed(및 중요한 후보)마다:
@@ -272,7 +273,7 @@ $LRA verify        # → out/16_검증결과.md
 | `coverage [--record]` | Stage A/B/C 비교·우선 출처 밖 발견·호출량 |
 | `candidates` `show` `screen` | 후보 검토(★=우선 출처)·선별 기록 |
 | `seed set/reject` `select` `deselect` `approve` | Seed·Core·Extended 선정/제외/승인 |
-| `dedup [--review/--link/--distinct]` `bibcheck` `integrity` `refresh` | 판본·국내외 중복·Crossref 서지 대조·정정/철회·메타데이터 보강 |
+| `dedup [--review/--link/--distinct/--unlink]` `bibcheck` `integrity` `refresh` | 판본·국내외 중복·Crossref 서지 대조·정정/철회·메타데이터 보강 |
 | `fetch` `ingest-fulltext` | OA 원문 다운로드·사용자 PDF 승격 |
 | `evidence add/reverify` `card` `mapping` `gap` `feedback add/resolve` | 분석 결과 등록 |
 | `render [01 01a 01b 02 03 03a … 13]` `export-bib` `verify` | 산출물·BibTeX·검증 |

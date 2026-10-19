@@ -5,7 +5,7 @@
 
 *An adaptive literature discovery, analysis, and synthesis workflow for Claude Code.*
 
-https://github.com/user-attachments/assets/ac382c96-bfc7-4076-b0d0-20296674a76f
+https://github.com/user-attachments/assets/8927d36c-e66e-4d88-8f22-1faff80fd522
 
 | 이런 일을 대신합니다 | 이런 것은 하지 않습니다 |
 |---|---|

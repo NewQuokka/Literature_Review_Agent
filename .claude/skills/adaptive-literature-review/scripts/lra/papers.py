@@ -76,15 +76,34 @@ def find_existing(con, rec: dict):
         if r:
             return r
     if rec.get("title") and not rec.get("doi"):
-        mine = set(_titles(rec))
-        for r in con.execute("SELECT * FROM papers WHERE year BETWEEN ? AND ?",
-                             ((rec.get("year") or 0) - 1, (rec.get("year") or 9999) + 1)):
-            if mine & set(_titles(r)):
-                # 제목이 같아도 첫 저자가 명백히 다르면 별개 연구
-                if _same_script_author_ok(json.dumps(rec.get("authors") or []), r["authors_json"]) is False:
-                    continue
+        for r in _title_overlaps(con, rec):
+            if _certain_same_work(rec, r):
                 return r
     return None
+
+
+def _is_korean(t: str | None) -> bool:
+    return bool(t) and any("\uac00" <= ch <= "\ud7a3" for ch in t)
+
+
+def _title_overlaps(con, rec: dict, exclude: str | None = None) -> list:
+    """제목(원제·번역 제목 포함)이 겹치고 연도가 ±1인 기존 레코드."""
+    mine = set(_titles(rec))
+    out = []
+    for r in con.execute("SELECT * FROM papers WHERE paper_id!=? AND year BETWEEN ? AND ?",
+                         (exclude or "", (rec.get("year") or 0) - 1, (rec.get("year") or 9999) + 1)):
+        if mine & set(_titles(r)):
+            out.append(r)
+    return out
+
+
+def _certain_same_work(rec: dict, r) -> bool:
+    """DOI 없이 자동 병합해도 되는가: 같은 언어의 원제목이 같고 첫 저자 비교가 '같음'(True)일 때만(#8).
+    번역 제목만 같거나, 저자를 비교할 수 없으면(None) 병합하지 않고 사람 확인으로 보낸다."""
+    a, b = rec.get("title"), r["title"]
+    if not a or not b or norm_title(a) != norm_title(b) or _is_korean(a) != _is_korean(b):
+        return False
+    return _same_script_author_ok(json.dumps(rec.get("authors") or []), r["authors_json"]) is True
 
 
 def possible_cross_db_duplicates(con, pid: str, rec: dict, threshold: float = 0.9) -> list[tuple[str, float]]:
@@ -101,14 +120,23 @@ def possible_cross_db_duplicates(con, pid: str, rec: dict, threshold: float = 0.
     return out
 
 
-def record_external_ids(con, pid: str, rec: dict, status: str = "MATCHED", related: str | None = None,
-                        confidence: float | None = None, note: str | None = None):
+def record_external_ids(con, pid: str, rec: dict):
+    """외부 식별자 기록. 중복 판정은 duplicate_pairs에 따로 두므로 재수집이 판정을 덮어쓰지 않는다(#8)."""
     for id_type, key in (("DOI", "doi"), ("KCI", "kci_id"), ("OpenAlex", "openalex_id"), ("UCI", "uci")):
         if rec.get(key):
             lang = "ko" if rec.get("title_ko") else "en"
-            con.execute("""INSERT OR REPLACE INTO paper_external_ids VALUES (?,?,?,?,?,?,?,?,?)""",
-                        (pid, id_type, rec[key], lang, confidence if confidence is not None else 1.0,
-                         status, related, note, db.now()))
+            con.execute("""INSERT INTO paper_external_ids VALUES (?,?,?,?,?,?,?,?,?)
+                           ON CONFLICT(paper_id, id_type, id_value) DO UPDATE SET checked_at=excluded.checked_at""",
+                        (pid, id_type, rec[key], lang, 1.0, "MATCHED", None, None, db.now()))
+
+
+def flag_duplicate(con, a: str, b: str, confidence: float, kind: str, note: str):
+    """중복 후보 쌍을 검토 대기로 올린다. 이미 있는 쌍(사람 판정 포함)은 건드리지 않는다."""
+    if a == b:
+        return
+    x, y = sorted((a, b))
+    con.execute("""INSERT OR IGNORE INTO duplicate_pairs(a, b, confidence, status, kind, note, checked_at)
+                   VALUES (?,?,?,?,?,?,?)""", (x, y, confidence, "REVIEW_DUPLICATE", kind, note, db.now()))
 
 
 def upsert(con, rec: dict, run_id: str | None = None) -> tuple[str, bool]:
@@ -148,7 +176,7 @@ def upsert(con, rec: dict, run_id: str | None = None) -> tuple[str, bool]:
                             (*updates.values(), pid))
             except Exception:
                 pass
-        record_external_ids(con, pid, rec, "MATCHED")
+        record_external_ids(con, pid, rec)
         return pid, False
     pid = db.next_id(con, "papers", "paper_id", "P-")
     con.execute("""INSERT INTO papers(paper_id, doi, openalex_id, title, year, authors_json, venue, venue_source_id,
@@ -167,18 +195,17 @@ def upsert(con, rec: dict, run_id: str | None = None) -> tuple[str, bool]:
                  rec.get("kci_id"), rec.get("uci"), rec.get("title_ko"), rec.get("title_en"),
                  rec.get("kci_citation_count"), rec.get("wos_citation_count"), rec.get("db_origin") or "OPENALEX"))
     db.set_membership(con, pid, "CANDIDATE", "PROPOSED", f"검색 수집({run_id})" if run_id else "수집")
-    dups = possible_cross_db_duplicates(con, pid, rec)
-    if dups:
-        for other, conf in dups:
-            record_external_ids(con, pid, rec, "REVIEW_DUPLICATE", other, conf, "국내외 DB 간 제목 유사(번역본 가능) — 사람 확인")
-    else:
-        record_external_ids(con, pid, rec, "MATCHED")
+    record_external_ids(con, pid, rec)
+    for other, conf in possible_cross_db_duplicates(con, pid, rec):
+        flag_duplicate(con, pid, other, conf, "cross_db", "국내외 DB 간 제목 유사(번역본 가능) — 사람 확인")
+    if not rec.get("doi"):   # 제목은 겹치지만 자동 병합 조건(같은 언어 원제목·같은 저자)을 못 채운 기존 레코드
+        for r in _title_overlaps(con, rec, exclude=pid):
+            flag_duplicate(con, pid, r["paper_id"], 1.0, "title", "DOI 없음·제목 일치(번역 제목 또는 저자 비교 불가) — 사람 확인")
     return pid, True
 
 
 def review_duplicates(con) -> list[dict]:
-    rows = con.execute("""SELECT DISTINCT paper_id, related_paper_id, match_confidence FROM paper_external_ids
-                          WHERE match_status='REVIEW_DUPLICATE'""").fetchall()
+    rows = con.execute("""SELECT a, b, confidence FROM duplicate_pairs WHERE status='REVIEW_DUPLICATE' ORDER BY a, b""").fetchall()
     out = []
     for r in rows:
         a = con.execute("SELECT paper_id, title, title_en, year, venue, db_origin FROM papers WHERE paper_id=?", (r[0],)).fetchone()
@@ -189,9 +216,16 @@ def review_duplicates(con) -> list[dict]:
 
 
 def resolve_duplicate(con, a: str, b: str, status: str, note: str):
-    con.execute("""UPDATE paper_external_ids SET match_status=?, note=COALESCE(note,'') || ? , checked_at=?
-                   WHERE (paper_id=? AND related_paper_id=?) OR (paper_id=? AND related_paper_id=?)""",
-                (status, f" / {status}: {note}", db.now(), a, b, b, a))
+    """사람의 판정(DISTINCT / MATCHED / 재검토 REVIEW_DUPLICATE)을 쌍에 기록한다. 후보가 아니던 쌍도 기록."""
+    x, y = sorted((a, b))
+    con.execute("""INSERT INTO duplicate_pairs(a, b, confidence, status, kind, note, checked_at) VALUES (?,?,NULL,?,'manual',?,?)
+                   ON CONFLICT(a, b) DO UPDATE SET status=excluded.status,
+                   note=COALESCE(duplicate_pairs.note, '') || ' / ' || excluded.note, checked_at=excluded.checked_at""",
+                (x, y, status, f"{status}: {note}", db.now()))
+
+
+def distinct_pairs(con) -> set[tuple[str, str]]:
+    return {(r[0], r[1]) for r in con.execute("SELECT a, b FROM duplicate_pairs WHERE status='DISTINCT'")}
 
 
 def find_version_duplicates(con) -> list[dict]:
@@ -227,6 +261,18 @@ def find_version_duplicates(con) -> list[dict]:
                     "a_doi": a["doi"], "b_doi": b["doi"],
                     "already_linked": bool(a["canonical_work_id"] or b["canonical_work_id"])})
     return out
+
+
+def unlink_versions(con, pid: str, note: str) -> str | None:
+    """판본 연결을 되돌린다. 돌려준 값: 이전 대표판 P-ID(연결이 없었으면 None)."""
+    r = con.execute("SELECT canonical_work_id FROM papers WHERE paper_id=?", (pid,)).fetchone()
+    keep = r[0] if r else None
+    if not keep:
+        return None
+    con.execute("UPDATE papers SET canonical_work_id=NULL, version_note=? WHERE paper_id=?", (f"연결 해제: {note}", pid))
+    resolve_duplicate(con, keep, pid, "REVIEW_DUPLICATE", f"판본 연결 해제 — {note}")
+    db.log_event(con, "unlink-versions", {"paper": pid, "was": keep, "note": note})
+    return keep
 
 
 def link_versions(con, keep: str, other: str, note: str):

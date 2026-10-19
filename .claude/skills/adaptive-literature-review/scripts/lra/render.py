@@ -77,7 +77,8 @@ def paper(con, pid):
 
 
 def member_rows(con, tiers=("CORE", "EXTENDED"), include_rejected=False):
-    q = f"""SELECT p.*, m.tier, m.status, m.reason AS m_reason, m.outside_reason FROM papers p JOIN paper_memberships m USING(paper_id)
+    q = f"""SELECT p.*, m.tier, m.status, m.reason AS m_reason, m.outside_reason, m.consent_note FROM papers p
+            JOIN paper_memberships m USING(paper_id)
             WHERE m.tier IN ({','.join('?' * len(tiers))})"""
     if not include_rejected:
         q += " AND m.status!='REJECTED'"
@@ -358,15 +359,10 @@ def r01b(con, paths):
     origin = Counter((r["db_origin"] or "OPENALEX") for r in core)
     L += ["", "## 3. Core/Extended 국내외 구성", "",
           f"- KCI 단독 {origin.get('KCI', 0)}편 · 해외 DB 단독 {origin.get('OPENALEX', 0)}편 · 양쪽에서 확인 {origin.get('BOTH', 0)}편"]
-    rows = con.execute("SELECT * FROM paper_external_ids WHERE match_status IN ('REVIEW_DUPLICATE','DISTINCT') ORDER BY paper_id").fetchall()
-    L += ["", "## 4. 국내외 중복 검토", "", "| P-ID | 관련 P-ID | 유사도 | 상태 | 메모 |", "|---|---|---|---|---|"]
-    seen = set()
+    rows = con.execute("SELECT * FROM duplicate_pairs ORDER BY a, b").fetchall()
+    L += ["", "## 4. 국내외·제목 중복 검토", "", "| P-ID | 관련 P-ID | 유사도 | 상태 | 메모 |", "|---|---|---|---|---|"]
     for r in rows:
-        k = (r["paper_id"], r["related_paper_id"], r["match_status"])
-        if k in seen:
-            continue
-        seen.add(k)
-        L.append(f"| {r['paper_id']} | {r['related_paper_id'] or '-'} | {r['match_confidence']} | {r['match_status']} | {md_cell(r['note'])} |")
+        L.append(f"| {r['a']} | {r['b']} | {r['confidence'] if r['confidence'] is not None else '-'} | {r['status']} | {md_cell(r['note'])} |")
     if not rows:
         L.append("| - | - | - | 검토 대상 없음 | |")
     n = notes(paths, "01b")

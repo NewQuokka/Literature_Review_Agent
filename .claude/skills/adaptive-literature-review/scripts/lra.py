@@ -181,6 +181,22 @@ def _brief(con, pids, limit=None):
     return rows
 
 
+_SOURCE_FIELD_TOKENS = ("source", "issn", "host_organization", "publisher", "repository", "journal")
+
+
+def source_restricting_clauses(flt: str | None) -> list[str]:
+    """OpenAlex filter 중 출처를 '포함 조건'으로 좁히는 절. 부정(!)만으로 된 제외 조건과 *.type은 허용(#7)."""
+    out = []
+    for clause in (c.strip() for c in (flt or "").split(",") if c.strip()):
+        key, _, val = clause.partition(":")
+        key = key.strip().lower()
+        if key.endswith(".type") or not any(t in key for t in _SOURCE_FIELD_TOKENS):
+            continue
+        if not all(v.strip().startswith("!") for v in val.split("|")):
+            out.append(clause)
+    return out
+
+
 def _exclusion_filter(con, extra: str = "") -> str:
     """사용자가 제외 요청한 출처는 모든 Stage에서 부정 필터로 뺀다."""
     parts = [x for x in [extra] if x]
@@ -210,8 +226,9 @@ def cmd_search(a):
     stage = a.stage or ("A" if source_ids else "C")
     if stage == "A" and not source_ids:
         raise SystemExit("Stage A는 우선 출처 필터(--sources)가 필요합니다. 제한 없는 검색은 --stage C.")
-    if stage == "C" and source_ids:
-        raise SystemExit("Stage C(독립·광역 검증)에는 출처 필터를 걸 수 없습니다.")
+    if stage == "C" and (source_ids or source_restricting_clauses(a.filter)):
+        raise SystemExit("Stage C(독립·광역 검증)에는 출처 필터를 걸 수 없습니다"
+                         + (f": {source_restricting_clauses(a.filter)}" if a.filter else "."))
     if stage == "B":
         raise SystemExit("Stage B는 `expand`(인용망·의미 확장)로 수행합니다.")
     flt = _exclusion_filter(con, a.filter or "")
@@ -253,8 +270,8 @@ def cmd_add_paper(a):
 def cmd_expand(a):
     """Stage B: 학술출처 제한 없이 인용망·의미 유사 확장."""
     paths, con, cfg, http = ctx(a)
-    if a.filter and "source.id:" in a.filter.replace("!", "") and "source.id:!" not in a.filter:
-        raise SystemExit("Stage B 확장에는 출처 제한 필터를 걸 수 없습니다(v1.2 원칙).")
+    if source_restricting_clauses(a.filter):
+        raise SystemExit(f"Stage B 확장에는 출처 제한 필터를 걸 수 없습니다: {source_restricting_clauses(a.filter)}")
     oa = OpenAlex(http, cfg, getattr(a, 'all_types', False))
     p = con.execute("SELECT * FROM papers WHERE paper_id=?", (pid_ok(con, a.paper),)).fetchone()
     if not p["openalex_id"]:
@@ -336,12 +353,17 @@ def cmd_source(a):
     for sid in a.ids:
         sid = sid.split("/")[-1]
         if a.action == "add":
+            ex = con.execute("SELECT 1 FROM preferred_sources WHERE source_id=? AND status='USER_EXCLUDED'", (sid,)).fetchone()
+            if ex and not a.user_restored:
+                raise SystemExit(f"{sid}는 사용자가 제외한 출처입니다. 사용자가 되살리라고 했을 때만 "
+                                 "--user-restored \"사용자 요청 내용\"으로 다시 추가하세요(#7).")
             s = oa.source(sid)   # 단건 조회 무료 — 실재 확인
             if not s:
                 raise SystemExit(f"{sid}: OpenAlex에 없는 출처 ID(임의 생성 금지)")
             con.execute("""INSERT OR REPLACE INTO preferred_sources(source_id, source_name, source_type, issn_l, field, role, scope_fit, source_list_evidence, works_count, priority, selection_reason, origin, status, approval, version_id, gap_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (sid, s.get("display_name"), s.get("type"), s.get("issn_l"), a.field, a.role, a.scope_fit,
-                         _list_evidence(s), s.get("works_count"), a.priority, a.reason, a.origin,
+                         _list_evidence(s), s.get("works_count"), a.priority,
+                         (a.reason or "") + (f" / 사용자 제외 해제: {a.user_restored}" if ex else ""), a.origin,
                          "ACTIVE", "PROPOSED" if a.origin == "agent" else "MODIFIED_BY_USER", ver, gap,
                          db.now(), db.now()))
             res.append({"source_id": sid, "name": s.get("display_name"), "type": s.get("type")})
@@ -507,17 +529,30 @@ def cmd_show(a):
     out(d)
 
 
-SOURCE_EXCLUSION_RE = re.compile(r"출처\s*밖|우선\s*출처|목록에\s*없|비우선|not in preferred|outside (the )?preferred", re.I)
+SOURCE_EXCLUSION_RE = re.compile(r"출처\s*밖|우선\s*출처|목록에\s*없|비우선|미수록|주요\s*학술지|권위|"
+                                 r"not in preferred|outside (the )?preferred|non-?preferred|(venue|journal) (is )?not (listed|indexed|preferred)",
+                                 re.I)
+
+
+EXCLUSION_CATEGORIES = {"relevance": "관련성", "role": "역할", "quality": "품질", "duplicate": "중복", "other": "기타"}
+
+
+def _exclusion_reason(a) -> str:
+    """제외 사유는 분류(관련성/역할/품질/중복/기타)를 고르게 한다. '우선 출처 밖'은 어떤 표현으로도 사유가 될 수 없다(#7)."""
+    if not a.category:
+        raise SystemExit("제외에는 --category relevance|role|quality|duplicate|other 중 하나가 필요합니다.")
+    if SOURCE_EXCLUSION_RE.search(a.reason):
+        raise SystemExit("v1.2 원칙: '우선 출처 밖'은 제외 사유가 될 수 없습니다. 연구질문 관련성·역할·품질로 판단하세요.")
+    return f"[{EXCLUSION_CATEGORIES[a.category]}] {a.reason}"
 
 
 def cmd_screen(a):
     paths, con, *_ = ctx(a)
-    if a.decision == "exclude" and SOURCE_EXCLUSION_RE.search(a.reason):
-        raise SystemExit("v1.2 원칙: '우선 출처 밖'은 제외 사유가 될 수 없습니다. 연구질문 관련성·역할·품질로 판단하세요.")
+    reason = _exclusion_reason(a) if a.decision == "exclude" else a.reason
     for pid in a.papers:
         pid_ok(con, pid)
         con.execute("INSERT INTO screening_decisions(paper_id, stage, decision, reason, decided_at, version_id) VALUES (?,?,?,?,?,?)",
-                    (pid, a.stage, a.decision, a.reason, db.now(), db.current_version(con)))
+                    (pid, a.stage, a.decision, reason, db.now(), db.current_version(con)))
     con.commit()
     out({"screened": a.papers, "decision": a.decision})
 
@@ -538,13 +573,18 @@ def cmd_seed(a):
     paths, con, *_ = ctx(a)
     pid_ok(con, a.paper)
     if a.action == "set":
+        origin = con.execute("SELECT db_origin FROM papers WHERE paper_id=?", (a.paper,)).fetchone()[0]
+        if db.search_mode(con) == "KCI" and (origin or "OPENALEX") == "OPENALEX" and not a.user_consented_mix:
+            raise SystemExit(f"{a.paper}는 해외 DB 문헌입니다. KCI 모드에서는 사용자 동의 없이 Seed(Core)로 두지 않습니다 "
+                             "(--user-consented-mix \"사용자 동의 내용\").")
         con.execute("INSERT OR REPLACE INTO seeds VALUES (?,?,?,?,?,?,?,?)",
                     (a.role, a.paper, a.reason, a.alternatives or "", "PROPOSED", 1 if a.provisional else 0,
                      db.now(), db.current_version(con)))
         _add_roles(con, a.paper, [a.role])
         m = db.membership(con, a.paper)
         if not m or m["tier"] == "CANDIDATE":
-            db.set_membership(con, a.paper, "CORE", "PROPOSED", f"Seed({a.role}): {a.reason}")
+            db.set_membership(con, a.paper, "CORE", "PROPOSED", f"Seed({a.role}): {a.reason}",
+                              consent_note=a.user_consented_mix)
     elif a.action == "reject":
         con.execute("UPDATE seeds SET status='REJECTED', reason=reason || ' / 교체사유: ' || ? WHERE role=? AND paper_id=?",
                     (a.reason, a.role, a.paper))
@@ -563,15 +603,15 @@ def cmd_select(a):
                 and not a.user_consented_mix):
             raise SystemExit(f"{pid}는 해외 DB 문헌입니다. KCI 모드에서는 사용자 동의 없이 Core에 넣지 않습니다 "
                              "(--user-consented-mix \"동의 내용\" 또는 --tier EXTENDED).")
-        dup = con.execute("SELECT related_paper_id FROM paper_external_ids WHERE paper_id=? AND match_status='REVIEW_DUPLICATE'",
-                          (pid,)).fetchone()
+        dup = db.pending_duplicates(con, pid)
         if dup:
-            print(f"⚠ {pid}는 {dup[0]}와 동일 연구일 수 있음(REVIEW_DUPLICATE) — `dedup --review`로 확인", file=sys.stderr)
+            print(f"⚠ {pid}는 {', '.join(dup)}와 동일 연구일 수 있음(REVIEW_DUPLICATE) — `dedup --review`로 확인", file=sys.stderr)
         _add_roles(con, pid, [r for r in (a.roles or "").split(",") if r])
         src = con.execute("SELECT venue_source_id FROM papers WHERE paper_id=?", (pid,)).fetchone()[0]
         if src not in db.all_preferred_ids(con) and not a.outside_reason:
             print(f"⚠ {pid}는 우선 출처 밖 문헌입니다 — `--outside-reason`으로 이 출처에서 고른 이유를 따로 적으세요", file=sys.stderr)
-        db.set_membership(con, pid, a.tier, "PROPOSED", a.reason, outside_reason=a.outside_reason)
+        db.set_membership(con, pid, a.tier, "PROPOSED", a.reason, outside_reason=a.outside_reason,
+                          consent_note=a.user_consented_mix)
         con.execute("INSERT INTO screening_decisions(paper_id, stage, decision, reason, decided_at, version_id) VALUES (?,?,?,?,?,?)",
                     (pid, "selection", "include", a.reason, db.now(), db.current_version(con)))
     _recompute_ranks(con)
@@ -583,6 +623,8 @@ def cmd_select(a):
 
 def cmd_deselect(a):
     paths, con, *_ = ctx(a)
+    if a.status == "REJECTED":
+        a.reason = _exclusion_reason(a)
     for pid in a.papers:
         m = db.membership(con, pid_ok(con, pid))
         db.set_membership(con, pid, m["tier"] if m else "CANDIDATE", a.status, a.reason, review_by=a.by)
@@ -594,12 +636,24 @@ def cmd_deselect(a):
 
 
 def cmd_approve(a):
+    """사용자 승인 기록. 승인자(--by)는 기본값 없이 반드시 밝힌다(#7)."""
     paths, con, *_ = ctx(a)
+    if a.by == "user" and not (a.evidence or "").strip():
+        raise SystemExit("--by user에는 사용자가 승인한 말을 --evidence \"...\"로 함께 기록하세요.")
+    bad = []
     for pid in a.papers:
         m = db.membership(con, pid_ok(con, pid))
-        db.set_membership(con, pid, m["tier"], "APPROVED", (m["reason"] or "") + f" / 승인: {a.note or ''}", review_by=a.by)
-        con.execute("UPDATE seeds SET status='APPROVED', provisional=0 WHERE paper_id=? AND status='PROPOSED'", (pid,))
-    db.log_event(con, "approve", {"papers": a.papers, "by": a.by})
+        if not m or m["tier"] == "CANDIDATE" or m["status"] == "REJECTED":
+            bad.append(f"{pid}({(m['tier'] + '/' + m['status']) if m else '선정 기록 없음'})")
+    if bad:
+        raise SystemExit(f"승인 대상이 아닙니다(먼저 select/seed set): {', '.join(bad)}")
+    for pid in a.papers:
+        m = db.membership(con, pid)
+        note = f" / 승인({a.by}): {a.note or ''}" + (f" — 근거: {a.evidence}" if a.evidence else "")
+        db.set_membership(con, pid, m["tier"], "APPROVED", (m["reason"] or "") + note, review_by=a.by)
+        if a.by == "user":   # Seed 임시선정 표시는 사용자 승인으로만 해제
+            con.execute("UPDATE seeds SET status='APPROVED', provisional=0 WHERE paper_id=? AND status='PROPOSED'", (pid,))
+    db.log_event(con, "approve", {"papers": a.papers, "by": a.by, "evidence": a.evidence})
     con.commit()
     out({"approved": a.papers, "by": a.by})
 
@@ -615,8 +669,32 @@ def cmd_dedup(a):
         con.commit()
         out({"distinct": [x, y]})
         return
+    if a.unlink:
+        pid = pid_ok(con, a.unlink)
+        keep = P.unlink_versions(con, pid, a.note or "사람 확인")
+        if not keep:
+            raise SystemExit(f"{pid}는 다른 문헌의 판본으로 연결되어 있지 않습니다.")
+        h = con.execute("""SELECT tier FROM membership_history WHERE paper_id=? AND status!='REJECTED'
+                           ORDER BY id DESC LIMIT 1""", (pid,)).fetchone()
+        m = db.membership(con, pid)
+        if m and m["status"] == "REJECTED" and h:   # 판본 통합으로 제외됐던 것을 되돌림(승인은 다시 받아야 함)
+            db.set_membership(con, pid, h[0], "PROPOSED", f"{keep}와의 판본 연결 해제 — 재검토")
+        _recompute_ranks(con)
+        con.commit()
+        out({"unlinked": pid, "was_canonical": keep, "pair_status": "REVIEW_DUPLICATE"})
+        return
     if a.link:
-        keep, other = a.link
+        keep, other = (pid_ok(con, x) for x in a.link)
+        if keep == other:
+            raise SystemExit("같은 P-ID끼리는 연결할 수 없습니다.")
+        k = con.execute("SELECT canonical_work_id FROM papers WHERE paper_id=?", (keep,)).fetchone()[0]
+        if k:
+            raise SystemExit(f"{keep}는 이미 {k}의 판본입니다 — 대표판({k})으로 연결하세요(순환·연쇄 연결 방지).")
+        o = con.execute("SELECT canonical_work_id FROM papers WHERE paper_id=?", (other,)).fetchone()[0]
+        if o and o != keep:
+            raise SystemExit(f"{other}는 이미 {o}의 판본입니다 — 먼저 `dedup --unlink {other}`.")
+        if con.execute("SELECT 1 FROM papers WHERE canonical_work_id=?", (other,)).fetchone():
+            raise SystemExit(f"{other}를 대표판으로 둔 판본이 있습니다 — 그 판본들을 먼저 {keep}로 옮기세요.")
         P.resolve_duplicate(con, keep, other, "MATCHED", a.note or "동일 연구(사람 확인)")
         P.link_versions(con, pid_ok(con, keep), pid_ok(con, other), a.note or "동일 연구의 다른 판본")
         m = db.membership(con, other)
@@ -991,7 +1069,7 @@ def _kci_search(a, paths, con, cfg, http):
         new += is_new
         pids.append(pid)
         con.execute("INSERT OR IGNORE INTO search_hits VALUES (?,?,?)", (rid, pid, rank))
-        if con.execute("SELECT 1 FROM paper_external_ids WHERE paper_id=? AND match_status='REVIEW_DUPLICATE'", (pid,)).fetchone():
+        if db.pending_duplicates(con, pid):
             review.append(pid)
     con.execute("UPDATE search_runs SET new_papers=? WHERE run_id=?", (new, rid))
     con.commit()
@@ -1007,11 +1085,13 @@ def cmd_rank(a):
         items = load_json(a.file)
         res = RK.add_scores(con, items if isinstance(items, list) else [items], a.by)
     elif a.action == "pin":
-        res = [RK.pin(con, pid_ok(con, p), a.rank, a.reason, a.by) for p in a.papers]
+        res = [RK.pin(con, pid_ok(con, p), a.rank, a.reason, a.by or "agent") for p in a.papers]
     elif a.action == "unpin":
-        res = [RK.pin(con, pid_ok(con, p), None, None, a.by) for p in a.papers]
+        res = [RK.pin(con, pid_ok(con, p), None, None, a.by or "agent") for p in a.papers]
     elif a.action == "approve":
-        res = {"approved": RK.approve(con, a.papers or None), "by": a.by}
+        if not a.by:
+            raise SystemExit("rank approve에는 승인자 --by가 필요합니다(사용자 승인이면 --by user).")
+        res = {"approved": RK.approve(con, a.papers or None, a.by), "by": a.by}
     elif a.action == "weights":
         if a.file:
             wv = RK.set_weights(con, load_json(a.file), a.reason or "", a.by)
@@ -1077,7 +1157,7 @@ def cmd_status(a):
          "search_runs": con.execute("SELECT COUNT(*) FROM search_runs").fetchone()[0],
          "search_mode": db.search_mode(con), "kci_ready": _kci_ready(paths, cfg)[1],
          "rankings": {r[0]: r[1] for r in con.execute("SELECT proposed_or_approved, COUNT(*) FROM paper_rankings WHERE is_current=1 GROUP BY 1")},
-         "review_duplicates": con.execute("SELECT COUNT(DISTINCT paper_id) FROM paper_external_ids WHERE match_status='REVIEW_DUPLICATE'").fetchone()[0],
+         "review_duplicates": con.execute("SELECT COUNT(*) FROM duplicate_pairs WHERE status='REVIEW_DUPLICATE'").fetchone()[0],
          "openalex_api_key": bool(cfg.get("openalex_api_key"))})
 
 
@@ -1099,6 +1179,7 @@ def main():
     s.add_argument("--name", help="add-kci: KCI 학술지명(정확히)"); s.add_argument("--verify-title", help="add-kci: 확인용 제목 검색어")
     s.add_argument("--kci-index-status", help="add-kci: KCI 등재 구분·확인일(포털 확인값)")
     s.add_argument("ids", nargs="*", help="OpenAlex 출처 ID(S...)")
+    s.add_argument("--user-restored", help="add: 사용자가 제외했던 출처를 되살리라고 한 내용")
     s.add_argument("--query"); s.add_argument("--type", choices=["journal", "conference", "repository", "book series"])
     s.add_argument("--limit", type=int, default=10)
     s.add_argument("--field", help="세부 분야(예: 과학기술정책)")
@@ -1138,12 +1219,15 @@ def main():
     s = sp.add_parser("show"); s.add_argument("paper"); s.set_defaults(f=cmd_show)
     s = sp.add_parser("screen", help="선별 결정 기록")
     s.add_argument("papers", nargs="+"); s.add_argument("--decision", required=True, choices=["include", "exclude", "hold"])
-    s.add_argument("--reason", required=True); s.add_argument("--stage", default="title_abstract"); s.set_defaults(f=cmd_screen)
+    s.add_argument("--reason", required=True); s.add_argument("--stage", default="title_abstract")
+    s.add_argument("--category", choices=list(EXCLUSION_CATEGORIES), help="exclude일 때 필수: 제외 사유 분류")
+    s.set_defaults(f=cmd_screen)
 
     s = sp.add_parser("seed"); s.add_argument("action", choices=["set", "reject"])
     s.add_argument("--role", required=True, choices=db.ROLES); s.add_argument("--paper", required=True)
     s.add_argument("--reason", required=True); s.add_argument("--alternatives", help="P-ID 쉼표구분")
-    s.add_argument("--provisional", action="store_true", help="사용자 확인 전 임시선정"); s.set_defaults(f=cmd_seed)
+    s.add_argument("--provisional", action="store_true", help="사용자 확인 전 임시선정")
+    s.add_argument("--user-consented-mix", help="KCI 모드에서 해외 문헌을 Seed로 두는 사용자 동의 내용"); s.set_defaults(f=cmd_seed)
     s = sp.add_parser("select", help="Core/Extended 제안")
     s.add_argument("papers", nargs="+"); s.add_argument("--tier", default="CORE", choices=["CORE", "EXTENDED"])
     s.add_argument("--roles", help="theory,methodology,empirical"); s.add_argument("--reason", required=True)
@@ -1153,12 +1237,15 @@ def main():
     s = sp.add_parser("deselect", help="제외/교체/재검토 표시(삭제 아님)")
     s.add_argument("papers", nargs="+"); s.add_argument("--reason", required=True)
     s.add_argument("--status", default="REJECTED", choices=["REJECTED", "REPLACEMENT_NEEDED", "RECHECK"])
+    s.add_argument("--category", choices=list(EXCLUSION_CATEGORIES), help="REJECTED일 때 필수: 제외 사유 분류")
     s.add_argument("--by", default="agent"); s.set_defaults(f=cmd_deselect)
     s = sp.add_parser("approve", help="사용자 승인 기록 — 사용자가 승인한 경우에만")
-    s.add_argument("papers", nargs="+"); s.add_argument("--by", default="user"); s.add_argument("--note")
+    s.add_argument("papers", nargs="+"); s.add_argument("--by", required=True, help="user(사용자 승인) 또는 승인한 사람")
+    s.add_argument("--evidence", help="사용자가 승인한 말(원문) — --by user일 때 필수"); s.add_argument("--note")
     s.set_defaults(f=cmd_approve)
     s = sp.add_parser("dedup", help="판본 중복 후보 탐지/연결")
     s.add_argument("--link", nargs=2, metavar=("KEEP", "OTHER")); s.add_argument("--note")
+    s.add_argument("--unlink", metavar="P-ID", help="판본 연결 되돌리기(잘못 연결한 경우)")
     s.add_argument("--review", action="store_true", help="국내외 중복 후보(REVIEW_DUPLICATE) 목록")
     s.add_argument("--distinct", nargs=2, metavar=("A", "B"), help="별개 연구로 확정")
     s.set_defaults(f=cmd_dedup)
@@ -1171,7 +1258,7 @@ def main():
     s = sp.add_parser("rank", help="논문별 중요도 점수·순위")
     s.add_argument("action", choices=["score", "pin", "unpin", "approve", "weights", "show"])
     s.add_argument("papers", nargs="*"); s.add_argument("--file"); s.add_argument("--rank", type=int)
-    s.add_argument("--reason"); s.add_argument("--by", default="agent")
+    s.add_argument("--reason"); s.add_argument("--by", help="pin/unpin 기본 agent, approve는 필수")
     s.set_defaults(f=cmd_rank)
     for name, fn, hlp in (("bibcheck", cmd_bibcheck, "Crossref 서지 대조"), ("integrity", cmd_integrity, "정정·철회 점검"),
                           ("fetch", cmd_fetch, "공개 원문 다운로드"),

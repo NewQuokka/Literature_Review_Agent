@@ -331,15 +331,41 @@ def run(con, paths: Paths) -> tuple[str, dict]:
         if "의 근거 아님" in t:
             ghost.append(f"{f.name}: 다른 논문의 근거 ID를 인용")
     nocard = [r["paper_id"] for r in core if not con.execute("SELECT 1 FROM analysis_cards WHERE paper_id=?", (r["paper_id"],)).fetchone()]
-    add("V15", "형식·완결성·허구 식별자", "FAIL" if ghost else ("WARN" if missing or nocard else "PASS"),
-        f"누락 산출물 {missing}; 분석카드 없는 문헌 {nocard}; DB에 없는 DOI/ID {ghost[:20]}")
+    # 본문(09·11)에서 인용한 문헌이 Core·Extended(제외 아님)가 아니면 참고문헌에 빠진다(#12)
+    from .render import CITE_BRACKET_RE, UNPARSED_CITE, parse_cite
+    cited_out, unparsed = [], []
+    for key in ("09", "11"):
+        f = paths.state / "notes" / f"{key}_body.md"
+        if not f.exists():
+            continue
+        for m in CITE_BRACKET_RE.finditer(f.read_text(encoding="utf-8")):
+            groups = parse_cite(m.group(1))
+            if groups is None:
+                unparsed.append(f"{key}:{m.group(0)[:40]}")
+                continue
+            cited_out += [f"{key}:{g['pid']}" for g in groups if g["pid"] in known_pid and g["pid"] not in ids]
+    for f in paths.out.glob("*.md"):
+        if not f.name.startswith("16_") and UNPARSED_CITE in f.read_text(encoding="utf-8") and f"{f.name}" not in str(unparsed):
+            unparsed.append(f"{f.name}: 렌더 결과에 해석 불가 인용")
+    add("V15", "형식·완결성·허구 식별자", "FAIL" if ghost or cited_out else ("WARN" if missing or nocard or unparsed else "PASS"),
+        f"누락 산출물 {missing}; 분석카드 없는 문헌 {nocard}; DB에 없는 DOI/ID {ghost[:20]}; "
+        f"본문에서 인용했지만 Core·Extended가 아닌(제외·후보) 문헌 {cited_out}; 해석 불가 인용 {unparsed[:10]}")
 
     # V16 중요도 순위 재현성·타당성
     from . import ranking as RK
     v16_fail, v16_warn = [], []
     weights = {r["weight_version"]: json.loads(r["weights_json"]) for r in con.execute("SELECT * FROM ranking_weights")}
     cur = con.execute("SELECT * FROM paper_rankings WHERE is_current=1").fetchall()
+    for wv, w in weights.items():   # 규칙 검사: 가중치 범위·합(#9)
+        if any(not (0 <= float(x) <= 1) for x in w.values()) or abs(sum(w.values()) - 1) > 1e-6:
+            v16_fail.append(f"가중치 {wv}가 범위(각 0~1, 합 1)를 벗어남: {w}")
+    for scope in ("CORE", "EXTENDED"):
+        pins = [r["pinned_rank"] for r in cur if r["set_scope"] == scope and r["pinned_rank"]]
+        if len(pins) != len(set(pins)) or any(p < 1 for p in pins):
+            v16_fail.append(f"{scope}: 같은 순위에 겹친 Pin 또는 1 미만 Pin {sorted(pins)}")
     for r in cur:
+        if r["importance_score"] is not None and not (0 <= r["importance_score"] <= 100):
+            v16_fail.append(f"{r['paper_id']}: 점수 {r['importance_score']}가 0~100 밖")
         w = weights.get(r["weight_version"])
         exp = RK.compute_score({c: r[c] for c in db.CRITERIA}, w) if w else "NO_WEIGHTS"
         if exp != r["importance_score"] and not (exp is not None and r["importance_score"] is not None and abs(exp - r["importance_score"]) < 0.01):
@@ -370,6 +396,9 @@ def run(con, paths: Paths) -> tuple[str, dict]:
                                                                     (r["paper_id"], r["tier"])).fetchone()]
     stale = [r["paper_id"] for r in cur if r["version_id"] != ver]
     pending = [r["paper_id"] for r in cur if r["proposed_or_approved"] == "PENDING_EVIDENCE"]
+    provisional = [r["paper_id"] for r in cur if RK.is_provisional(r)]
+    if provisional:
+        v16_warn.append(f"잠정 점수(근거 적절성 미평가) {provisional} — 원문 확인 후 재평가")
     if unranked:
         v16_warn.append(f"미평가 Core/Extended {unranked}")
     if stale:

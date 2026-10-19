@@ -108,11 +108,11 @@
 ```json
 [{
   "paper_id": "P-007",
-  "research_fit": 5, "role_contribution": 4, "evidence_quality": 3, "distinctiveness": 2, "time_relevance": 4,
+  "research_fit": 5, "role_contribution": 4, "evidence_quality": null, "distinctiveness": 2, "time_relevance": 4,
   "rationale": {
     "research_fit": "H1(공공 R&D → 중소기업 특허)과 동일한 관계를 같은 대상으로 분석",
     "role_contribution": "실증 Seed 대안, 표본 구성·변수 정의를 그대로 참고 가능",
-    "evidence_quality": "패널 DID, 사전추세 검증 보고(초록 기준) — 전문 확인 전 잠정",
+    "evidence_quality": "",
     "distinctiveness": "다른 Core와 같은 데이터원 사용",
     "time_relevance": "2021년, 최근 제도 개편 이후 자료"
   },

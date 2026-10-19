@@ -17,14 +17,29 @@ TIERS = ("A", "B", "C")
 TIER_KO = {"A": "A 핵심 활용", "B": "B 적극 참고", "C": "C 보완 참고", "평가보류": "평가보류"}
 
 
+PROVISIONAL_CRITERION = "evidence_quality"   # 초록만으로는 판단하기 어려워 비워 둘 수 있는 기준
+
+
 def compute_score(scores: dict, weights: dict) -> float | None:
-    if any(scores.get(c) is None for c in db.CRITERIA):
-        return None
+    """0~100 점수. 근거 적절성만 비었으면 나머지 기준의 가중치로 정규화한 '잠정' 점수(#9).
+    다른 기준이 비면 None(평가보류)."""
+    missing = [c for c in db.CRITERIA if scores.get(c) is None]
     for c in db.CRITERIA:
-        v = scores[c]
-        if not (0 <= float(v) <= 5):
+        v = scores.get(c)
+        if v is not None and not (0 <= float(v) <= 5):
             raise ValueError(f"{c}={v}: 0~5 범위를 벗어남")
-    return round(sum(weights[c] * float(scores[c]) for c in db.CRITERIA) * 20, 2)
+    if not missing:
+        return round(sum(weights[c] * float(scores[c]) for c in db.CRITERIA) * 20, 2)
+    if missing == [PROVISIONAL_CRITERION]:
+        w = sum(weights[c] for c in db.CRITERIA if c != PROVISIONAL_CRITERION)
+        if w <= 0:
+            return None
+        return round(sum(weights[c] * float(scores[c]) for c in db.CRITERIA if c != PROVISIONAL_CRITERION) / w * 20, 2)
+    return None
+
+
+def is_provisional(r) -> bool:
+    return r["importance_score"] is not None and r[PROVISIONAL_CRITERION] is None
 
 
 def _tie_key(r):
@@ -54,12 +69,14 @@ def _rank_with_ties(rows) -> dict[int, tuple[int, str]]:
 
 
 def current_rows(con, scope: str):
-    """현재 연구계획 버전에서 해당 집합(CORE/EXTENDED)의 현행 평가(제외된 문헌 빼고)."""
+    """현재 연구계획 버전에서 해당 집합(CORE/EXTENDED)의 현행 평가(제외된 문헌 빼고).
+    이전 버전 기준 평가는 섞지 않는다 — V16이 재평가 필요로 알린다(#9). 순서는 P-ID로 고정."""
     return con.execute("""SELECT r.*, p.role_tags FROM paper_rankings r
                           JOIN paper_memberships m ON m.paper_id=r.paper_id
                           JOIN papers p ON p.paper_id=r.paper_id
-                          WHERE r.is_current=1 AND r.set_scope=? AND m.tier=? AND m.status!='REJECTED'""",
-                       (scope, scope)).fetchall()
+                          WHERE r.is_current=1 AND r.set_scope=? AND m.tier=? AND m.status!='REJECTED'
+                          AND r.version_id IS ? ORDER BY r.paper_id""",
+                       (scope, scope, db.current_version(con))).fetchall()
 
 
 def recompute(con, scope: str) -> None:
@@ -90,10 +107,24 @@ def recompute(con, scope: str) -> None:
                 break
             final[nxt["eval_id"]] = pos
         pos += 1
-    has_pin = bool(pins)
+    # 표기: Pin이 있어도 고정되지 않은 동점 문헌끼리는 공동 순위(n=)를 유지한다(#9)
+    by_final = sorted(scored, key=lambda r: final[r["eval_id"]])
+    labels: dict[int, str] = {}
+    groups: list[list] = []
+    for r in (x for x in by_final if x["eval_id"] not in pins):
+        if groups and _tie_key(groups[-1][-1]) == _tie_key(r):
+            groups[-1].append(r)
+        else:
+            groups.append([r])
+    for g in groups:
+        first = min(final[r["eval_id"]] for r in g)
+        for r in g:
+            labels[r["eval_id"]] = f"{first}=" if len(g) > 1 else str(final[r["eval_id"]])
+    for eid in pins:
+        labels[eid] = str(final[eid])
     for r in scored:
         rank = final[r["eval_id"]]
-        label = str(rank) if has_pin else ai[r["eval_id"]][1]
+        label = labels[r["eval_id"]] + (" (잠정)" if is_provisional(r) else "")
         con.execute("UPDATE paper_rankings SET ai_rank=?, core_rank=?, rank_label=? WHERE eval_id=?",
                     (ai[r["eval_id"]][0], rank, label, r["eval_id"]))
     for r in pending:
@@ -103,9 +134,14 @@ def recompute(con, scope: str) -> None:
     for role in db.ROLES:
         col = f"{role}_rank"
         con.execute(f"UPDATE paper_rankings SET {col}=NULL WHERE eval_id IN ({','.join(str(r['eval_id']) for r in rows) or 0})")
-        members = [r for r in scored if role in (r["role_tags"] or "").split(",")]
-        for i, r in enumerate(sorted(members, key=lambda r: final[r["eval_id"]]), 1):
-            con.execute(f"UPDATE paper_rankings SET {col}=? WHERE eval_id=?", (i, r["eval_id"]))
+        members = sorted((r for r in scored if role in (r["role_tags"] or "").split(",")), key=lambda r: final[r["eval_id"]])
+        prev, prev_rank = None, 0
+        for i, r in enumerate(members, 1):
+            tie = (prev is not None and prev["eval_id"] not in pins and r["eval_id"] not in pins
+                   and _tie_key(prev) == _tie_key(r))
+            prev_rank = prev_rank if tie else i   # 역할별 순위에도 같은 동점 규칙
+            con.execute(f"UPDATE paper_rankings SET {col}=? WHERE eval_id=?", (prev_rank, r["eval_id"]))
+            prev = r
 
 
 def add_scores(con, items: list[dict], evaluated_by: str = "agent") -> list[dict]:
@@ -150,6 +186,8 @@ def add_scores(con, items: list[dict], evaluated_by: str = "agent") -> list[dict
                      it.get("change_reason") or (None if not prev else "재평가"), evaluated_by))
         scopes.add(m["tier"])
         r = {"paper_id": pid, "score": score, "status": status, "tier": tier}
+        if score is not None and scores[PROVISIONAL_CRITERION] is None:
+            r["provisional"] = "근거 적절성 미평가 — 나머지 기준으로 정규화한 잠정 점수(원문 확인 후 재평가)"
         if score is not None and tier is None:
             r["warning"] = "tier(A/B/C) 미지정 — 점수 분포·역할을 보고 지정하세요"
         if prev:
@@ -166,6 +204,13 @@ def pin(con, pid: str, rank: int | None, reason: str | None, by: str = "user") -
         raise SystemExit(f"{pid}: 현행 중요도 평가가 없음 — 먼저 `rank score`")
     if rank is not None and not reason:
         raise SystemExit("Pin에는 --reason(사용자 수정 사유)이 필요합니다")
+    if rank is not None and rank < 1:
+        raise SystemExit(f"--rank는 1 이상이어야 합니다(받은 값 {rank})")
+    if rank is not None:
+        other = con.execute("""SELECT paper_id FROM paper_rankings WHERE is_current=1 AND set_scope=? AND pinned_rank=?
+                               AND paper_id!=?""", (r["set_scope"], rank, pid)).fetchone()
+        if other:   # 같은 자리에 두 편을 고정하면 한 편이 말없이 밀려남(#9)
+            raise SystemExit(f"{other[0]}가 이미 {rank}위로 고정되어 있습니다 — 먼저 `rank unpin {other[0]}` 또는 다른 순위")
     con.execute("""UPDATE paper_rankings SET pinned_rank=?, override_reason=?, proposed_or_approved=?, evaluated_by=?
                    WHERE eval_id=?""",
                 (rank, reason if rank is not None else None,
@@ -192,6 +237,9 @@ def approve(con, pids: list[str] | None, by: str) -> int:
 def set_weights(con, weights: dict, note: str, by: str) -> str:
     if set(weights) != set(db.CRITERIA):
         raise SystemExit(f"가중치 키는 {db.CRITERIA} 다섯 개여야 합니다")
+    bad = {k: v for k, v in weights.items() if not (0 <= float(v) <= 1)}
+    if bad:   # 합만 보면 음수·1 초과 가중치로 100점을 넘는 점수가 나옴(#9)
+        raise SystemExit(f"가중치는 각각 0 이상 1 이하여야 합니다: {bad}")
     if abs(sum(weights.values()) - 1) > 1e-6:
         raise SystemExit(f"가중치 합이 1이어야 합니다(현재 {sum(weights.values())})")
     n = con.execute("SELECT COUNT(*) FROM ranking_weights").fetchone()[0]

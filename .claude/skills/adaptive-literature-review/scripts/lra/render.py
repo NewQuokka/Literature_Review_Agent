@@ -13,23 +13,50 @@ from .config import CORE_TARGET, Paths
 
 ROLE_KO = {"theory": "이론", "methodology": "방법론", "empirical": "유사 실증사례"}
 USABLE_EVIDENCE = ("VERIFIED_FULLTEXT", "ABSTRACT_BASED")   # 보고서 본문에서 인용해도 되는 근거 상태
-PID_RE = re.compile(r"\[(P-\d{3,})(?:[,;]\s*(E-\d{3,}-\d{2,}(?:[,;]\s*E-\d{3,}-\d{2,})*))?\]")
 
 
 def md_cell(s) -> str:
     if s is None or s == "":
         return "확인 필요"
-    return str(s).replace("|", "\\|").replace("\n", " ")
+    return str(s).replace("|", "\\|").replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+
+
+_NUMERIC_CELL = re.compile(r"[-+]?\d[\d,]*(\.\d+)?%?")
+
+
+def csv_safe(v):
+    """Excel이 수식으로 해석하는 셀(=,+,-,@로 시작)을 텍스트로 고정. 숫자(음수 포함)는 그대로(#12)."""
+    if isinstance(v, str) and v[:1] in ("=", "+", "-", "@", "\t", "\r") and not _NUMERIC_CELL.fullmatch(v):
+        return "'" + v
+    return v
+
+
+class SafeWriter:
+    def __init__(self, fh):
+        self._w = csv.writer(fh)
+
+    def writerow(self, row):
+        self._w.writerow([csv_safe(x) for x in row])
+
+
+_ORG_RE = re.compile(r"\b(group|bank|organi[sz]ation|institute|university|agency|ministry|council|committee|association|"
+                     r"foundation|office|commission|consortium|centre|center|oecd|unesco|who)\b|연구원|위원회|협회|재단|부$|청$|공단", re.I)
 
 
 def authors_list(p) -> list[dict]:
+    """[{family, given, corporate}]. 단체 저자는 이름 전체를 family로 둔다(성으로 쪼개지 않음, #12)."""
     cr = json.loads(p["crossref_json"] or "{}") if "crossref_json" in p.keys() else {}
     if cr.get("author"):
-        return [{"family": a.get("family") or a.get("name") or "", "given": a.get("given") or ""} for a in cr["author"]]
+        return [{"family": a.get("family") or a.get("name") or "", "given": a.get("given") or "",
+                 "corporate": not a.get("family") and bool(a.get("name"))} for a in cr["author"]]
     out = []
     for a in json.loads(p["authors_json"] or "[]"):
-        parts = (a.get("name") or "").split()
-        out.append({"family": parts[-1] if parts else "", "given": " ".join(parts[:-1])})
+        name = (a.get("name") or "").strip()
+        if _ORG_RE.search(name):
+            out.append({"family": name, "given": "", "corporate": True})
+            continue
+        parts = name.split()
+        out.append({"family": parts[-1] if parts else "", "given": " ".join(parts[:-1]), "corporate": False})
     return out
 
 
@@ -50,6 +77,8 @@ def apa(p) -> str:
     au = authors_list(p)
 
     def one(a):
+        if a.get("corporate"):
+            return a["family"]
         initials = " ".join(x[0] + "." for x in re.split(r"[\s\-]+", a["given"]) if x)
         return f"{a['family']}, {initials}".strip().rstrip(",")
     if not au:
@@ -69,7 +98,9 @@ def apa(p) -> str:
     if pg:
         tail += f", {pg}"
     doi = f" https://doi.org/{p['doi']}" if p["doi"] else (f" https://openalex.org/{p['openalex_id']}" if p["openalex_id"] else "")
-    return f"{names} ({p['year'] or 'n.d.'}). {p['title']}.{tail}.{doi}".replace("..", ".")
+    title = (p["title"] or "").strip()
+    title += "" if title.endswith((".", "?", "!")) else "."   # 제목 끝 마침표만 중복 방지(… 생략 표기는 건드리지 않음)
+    return f"{names} ({p['year'] or 'n.d.'}). {title}" + (f"{tail}." if tail else "") + doi
 
 
 def paper(con, pid):
@@ -107,27 +138,66 @@ def notes(paths: Paths, key: str) -> str | None:
     return f.read_text(encoding="utf-8") if f.exists() else None
 
 
+CITE_BRACKET_RE = re.compile(r"\[(\s*P-\d{3,}[^\[\]\n]*)\]")
+_PAGE_TOKEN = re.compile(r"(?:pp?\.\s*\d+(?:\s*[-–]\s*\d+)?|\d+(?:\s*[-–]\s*\d+)?\s*쪽)", re.I)
+UNPARSED_CITE = "⚠ 인용 형식 해석 불가"
+
+
+def parse_cite(inner: str) -> list[dict] | None:
+    """'P-003, p. 12; E-003-02; P-005' → [{pid, eids, page}]. 해석할 수 없는 토큰이 있으면 None."""
+    groups = []
+    for tok in (t.strip() for t in re.split(r"[;,]", inner)):
+        if not tok:
+            continue
+        if re.fullmatch(r"P-\d{3,}", tok):
+            groups.append({"pid": tok, "eids": [], "page": None})
+        elif re.fullmatch(r"E-\d{3,}-\d{2,}", tok) and groups:
+            groups[-1]["eids"].append(tok)
+        elif _PAGE_TOKEN.fullmatch(tok) and groups and not groups[-1]["page"]:
+            groups[-1]["page"] = tok
+        else:
+            return None
+    return groups or None
+
+
 def cite_replace(con, text: str, cited: set) -> str:
+    """본문의 [P-xxx; E-xxx-yy] 인용을 서지로 바꾼다. 한 괄호의 여러 논문·쪽수 표기도 받는다(#12)."""
     def rep(m):
-        pid = m.group(1)
-        p = paper(con, pid)
-        if not p:
-            return f"[{pid} — ⚠ DB에 없는 ID]"
-        cited.add(pid)
-        labels = []
-        for eid in re.findall(r"E-\d{3,}-\d{2,}", m.group(2) or ""):
-            row = con.execute("SELECT paper_id, verification_status FROM evidence WHERE evidence_id=?", (eid,)).fetchone()
-            if not row:
-                labels.append(f"{eid} — ⚠ DB에 없는 ID")
-            elif row[0] != pid:
-                labels.append(f"{eid} — ⚠ {pid}의 근거 아님")
-            elif row[1] not in USABLE_EVIDENCE:
-                labels.append(f"{eid} — ⚠ {row[1]}(사용 금지)")   # 규칙 2: 확인되지 않은 근거를 깔끔하게 렌더하지 않음(#4)
-            else:
-                labels.append(eid)
-        ev = "; " + ", ".join(labels) if labels else ""
-        return f"({short_cite(p)} [{pid}{ev}])"
-    return PID_RE.sub(rep, text)
+        groups = parse_cite(m.group(1))
+        if groups is None:
+            return f"{m.group(0)} {UNPARSED_CITE}"
+        cites, ids = [], []
+        for g in groups:
+            one = _cite_one(con, g["pid"], g["eids"], cited)
+            if one is None:
+                ids.append(f"{g['pid']} — ⚠ DB에 없는 ID")
+                continue
+            cites.append(one[0] + (f", {g['page']}" if g["page"] else ""))
+            ids.append(one[1])
+        if not cites:
+            return "[" + "; ".join(ids) + "]"
+        return f"({'; '.join(cites)} [{' / '.join(ids)}])"
+    return CITE_BRACKET_RE.sub(rep, text)
+
+
+def _cite_one(con, pid: str, eids: list[str], cited: set):
+    p = paper(con, pid)
+    if not p:
+        return None
+    cited.add(pid)
+    labels = []
+    for eid in eids:
+        row = con.execute("SELECT paper_id, verification_status FROM evidence WHERE evidence_id=?", (eid,)).fetchone()
+        if not row:
+            labels.append(f"{eid} — ⚠ DB에 없는 ID")
+        elif row[0] != pid:
+            labels.append(f"{eid} — ⚠ {pid}의 근거 아님")
+        elif row[1] not in USABLE_EVIDENCE:
+            labels.append(f"{eid} — ⚠ {row[1]}(사용 금지)")   # 규칙 2: 확인되지 않은 근거를 깔끔하게 렌더하지 않음(#4)
+        else:
+            labels.append(eid)
+    ev = "; " + ", ".join(labels) if labels else ""
+    return short_cite(p), f"{pid}{ev}"
 
 
 def latest_profile(con):
@@ -398,7 +468,7 @@ def r02(con, paths):
 def r03(con, paths):
     f = paths.out / "03_핵심문헌_20편.csv"
     with open(f, "w", newline="", encoding="utf-8-sig") as fh:
-        w = csv.writer(fh)
+        w = SafeWriter(fh)
         w.writerow(["paper_id", "구분", "승인상태", "중요도순위", "역할별순위", "중요도점수", "중요도등급", "순위상태",
                     "중요도근거(관련성·역할)", "역할", "Seed", "저자연도", "제목", "국문제목", "영문제목", "연도", "검색DB", "KCI_ID",
                     "출처(학술지·학회)",
@@ -519,7 +589,7 @@ def r04(con, paths):
 def r05(con, paths):
     f = paths.out / "05_원문확보_현황.csv"
     with open(f, "w", newline="", encoding="utf-8-sig") as fh:
-        w = csv.writer(fh)
+        w = SafeWriter(fh)
         w.writerow(["paper_id", "구분", "저자연도", "원문상태", "파일경로", "출처URL", "출처유형", "판본", "라이선스",
                     "쪽수", "제목일치도", "SHA256", "확보일시"])
         for r in member_rows(con):
@@ -797,18 +867,34 @@ def render(con, paths: Paths, which: list[str] | None = None) -> list[str]:
     return done
 
 
+_TEX = {"\\": r"\textbackslash{}", "&": r"\&", "%": r"\%", "$": r"\$", "#": r"\#", "_": r"\_",
+        "{": r"\{", "}": r"\}", "~": r"\textasciitilde{}", "^": r"\textasciicircum{}"}
+
+
+def tex(s) -> str:
+    """BibTeX 값의 LaTeX 특수문자 이스케이프(#12)."""
+    return "".join(_TEX.get(ch, ch) for ch in str(s))
+
+
 def bibtex(con, paths: Paths) -> str:
     out = []
     for r in member_rows(con):
         au = authors_list(r)
         key = f"{re.sub(r'[^A-Za-z]', '', au[0]['family']) if au else 'anon'}{r['year'] or ''}_{r['paper_id'].replace('-', '')}"
         cr = json.loads(r["crossref_json"] or "{}")
-        fields = {"title": "{" + (r["title"] or "") + "}",
-                  "author": " and ".join(f"{a['family']}, {a['given']}".strip(", ") for a in au),
-                  "year": r["year"], "journal": r["venue"], "doi": r["doi"],
+        names = []
+        for a in au:
+            if a.get("corporate"):
+                names.append("{" + tex(a["family"]) + "}")   # 단체 저자: 성·이름으로 쪼개지 않게
+            else:
+                names.append(tex(f"{a['family']}, {a['given']}".strip(", ")))
+        fields = {"title": "{" + tex(r["title"] or "") + "}",   # 바깥 중괄호와 합쳐 {{…}} — 대소문자 보호
+                  "author": " and ".join(names),
+                  "year": r["year"], "journal": tex(r["venue"]) if r["venue"] else None, "doi": r["doi"],
                   "volume": cr.get("volume"), "number": cr.get("issue"), "pages": (cr.get("page") or "").replace("-", "--") or None,
-                  "note": f"{r['paper_id']}; fulltext={db.fulltext_status(con, r['paper_id'])}; bib={r['bib_match'] or 'NOT_CHECKED'}"}
+                  # 내부 메모는 스타일이 인쇄하지 않는 비표준 필드로(note에 두면 참고문헌에 찍힘)
+                  "x-lra": f"{r['paper_id']}; fulltext={db.fulltext_status(con, r['paper_id'])}; bib={r['bib_match'] or 'NOT_CHECKED'}"}
         typ = "article" if (r["work_type"] or "article") in ("article", "review") else "misc"
-        body = ",\n".join(f"  {k} = {{{v}}}" if not str(v).startswith("{") else f"  {k} = {v}" for k, v in fields.items() if v)
+        body = ",\n".join(f"  {k} = {{{v}}}" for k, v in fields.items() if v)
         out.append(f"@{typ}{{{key},\n{body}\n}}")
     return "\n\n".join(out) + "\n"

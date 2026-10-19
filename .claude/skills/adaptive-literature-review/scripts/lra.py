@@ -21,7 +21,7 @@ except Exception:
     pass
 
 from lra import db, papers as P, fulltext as FT, render as R, verify as V  # noqa: E402
-from lra.config import Http, Paths, load_config, QUOTE_MAX_WORDS  # noqa: E402
+from lra.config import Http, Paths, load_config, EVIDENCE_TYPES, QUOTE_MAX_WORDS  # noqa: E402
 from lra.sources import Crossref, OpenAlex, SemanticScholar, oa_to_record, norm_doi, search_value  # noqa: E402
 
 
@@ -568,7 +568,10 @@ def cmd_select(a):
         if dup:
             print(f"⚠ {pid}는 {dup[0]}와 동일 연구일 수 있음(REVIEW_DUPLICATE) — `dedup --review`로 확인", file=sys.stderr)
         _add_roles(con, pid, [r for r in (a.roles or "").split(",") if r])
-        db.set_membership(con, pid, a.tier, "PROPOSED", a.reason)
+        src = con.execute("SELECT venue_source_id FROM papers WHERE paper_id=?", (pid,)).fetchone()[0]
+        if src not in db.all_preferred_ids(con) and not a.outside_reason:
+            print(f"⚠ {pid}는 우선 출처 밖 문헌입니다 — `--outside-reason`으로 이 출처에서 고른 이유를 따로 적으세요", file=sys.stderr)
+        db.set_membership(con, pid, a.tier, "PROPOSED", a.reason, outside_reason=a.outside_reason)
         con.execute("INSERT INTO screening_decisions(paper_id, stage, decision, reason, decided_at, version_id) VALUES (?,?,?,?,?,?)",
                     (pid, "selection", "include", a.reason, db.now(), db.current_version(con)))
     _recompute_ranks(con)
@@ -700,15 +703,22 @@ def cmd_ingest(a):
 def cmd_evidence(a):
     paths, con, *_ = ctx(a)
     if a.action == "reverify":
-        changed = []
-        for e in con.execute("SELECT * FROM evidence"):
+        changed, redone = [], []
+        if a.reextract:   # 대조 기준 텍스트를 PDF에서 다시 만든 뒤 재검증(#4)
+            for (pid,) in con.execute("SELECT paper_id FROM fulltexts WHERE access_status='FULL_PDF'").fetchall():
+                if FT.reextract(con, paths, pid):
+                    redone.append(pid)
+        for e in con.execute("SELECT * FROM evidence").fetchall():
             st, note = FT.verify_evidence_item(con, paths, dict(e))
-            if st != e["verification_status"] or "재검증 필요" in (e["verification_note"] or ""):
-                con.execute("UPDATE evidence SET verification_status=?, verification_note=? WHERE evidence_id=?",
-                            (st, note, e["evidence_id"]))
+            page = e["pdf_page"]
+            if st == "VERIFIED_FULLTEXT" and not page:
+                page = FT.verified_page(paths, e["paper_id"], e["verbatim_short_quote"] or "")
+            if st != e["verification_status"] or page != e["pdf_page"] or "재검증 필요" in (e["verification_note"] or ""):
+                con.execute("UPDATE evidence SET verification_status=?, verification_note=?, pdf_page=? WHERE evidence_id=?",
+                            (st, note, page, e["evidence_id"]))
                 changed.append({"id": e["evidence_id"], "from": e["verification_status"], "to": st})
         con.commit()
-        out(changed or "변동 없음")
+        out({"reextracted": redone, "changed": changed} if a.reextract else (changed or "변동 없음"))
         return
     items = load_json(a.file)
     items = items if isinstance(items, list) else [items]
@@ -719,9 +729,16 @@ def cmd_evidence(a):
         if q and len(q.split()) > QUOTE_MAX_WORDS:
             res.append({"paper_id": pid, "rejected": f"인용 {len(q.split())}단어 > {QUOTE_MAX_WORDS} — 짧은 발췌로 줄이세요"})
             continue
+        if it.get("type", "finding") not in EVIDENCE_TYPES:   # 오타 유형은 V08 수치 대조를 조용히 건너뛰게 함(#11)
+            res.append({"paper_id": pid, "rejected": f"type '{it.get('type')}' — 허용: {', '.join(EVIDENCE_TYPES)}"})
+            continue
         st, note = FT.verify_evidence_item(con, paths, it)
         if st != "VERIFIED_FULLTEXT" and db.fulltext_status(con, pid) not in ("FULL_PDF", "FULL_XML"):
             it["pdf_page"] = None   # 원문 없이 쪽수를 기록하지 않음
+        if st == "VERIFIED_FULLTEXT" and not it.get("pdf_page"):
+            it["pdf_page"] = FT.verified_page(paths, pid, q)   # 자동 보정한 쪽을 저장(#4)
+        if st != "VERIFIED_FULLTEXT":
+            it["printed_page"] = None   # 인쇄 쪽수는 원문 대조가 끝난 근거에만(#4)
         if it.get("evidence_id"):
             eid = it["evidence_id"]
         else:
@@ -734,6 +751,8 @@ def cmd_evidence(a):
         res.append({"evidence_id": eid, "status": st, "note": note})
     con.commit()
     out(res)
+    if any("rejected" in r for r in res):
+        sys.exit(1)   # 항목별 거부가 있으면 0이 아닌 종료 코드(#11)
 
 
 def cmd_card(a):
@@ -1037,6 +1056,8 @@ def cmd_verify(a):
     text, summ = V.run(con, paths)
     (paths.out / "16_검증결과.md").write_text(text, encoding="utf-8")
     out({"written": "out/16_검증결과.md", **summ})
+    if summ["fail"]:
+        sys.exit(1)   # FAIL이 있으면 종료 코드 1 — 실행 오류가 아니라 '고칠 것이 있음'(#11)
 
 
 def cmd_status(a):
@@ -1127,6 +1148,7 @@ def main():
     s.add_argument("papers", nargs="+"); s.add_argument("--tier", default="CORE", choices=["CORE", "EXTENDED"])
     s.add_argument("--roles", help="theory,methodology,empirical"); s.add_argument("--reason", required=True)
     s.add_argument("--user-consented-mix", help="KCI 모드에서 해외 문헌을 Core에 넣는 사용자 동의 내용")
+    s.add_argument("--outside-reason", help="우선 출처 밖 문헌을 고른 이유(일반 선정 사유와 별도, 03 CSV에 기록)")
     s.set_defaults(f=cmd_select)
     s = sp.add_parser("deselect", help="제외/교체/재검토 표시(삭제 아님)")
     s.add_argument("papers", nargs="+"); s.add_argument("--reason", required=True)
@@ -1164,6 +1186,7 @@ def main():
     s.add_argument("files", nargs="+"); s.add_argument("--paper"); s.set_defaults(f=cmd_ingest)
 
     s = sp.add_parser("evidence"); s.add_argument("action", choices=["add", "reverify"]); s.add_argument("--file")
+    s.add_argument("--reextract", action="store_true", help="reverify 전에 PDF에서 쪽별 텍스트를 다시 추출")
     s.set_defaults(f=cmd_evidence)
     s = sp.add_parser("card", help="분석카드(+품질) 등록"); s.add_argument("--file", required=True); s.set_defaults(f=cmd_card)
     s = sp.add_parser("mapping", help="장절 활용 매핑 등록"); s.add_argument("--file", required=True); s.set_defaults(f=cmd_mapping)

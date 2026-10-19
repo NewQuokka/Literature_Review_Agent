@@ -134,7 +134,7 @@ $LRA search --query "<independent 검색식>" --purpose independent --limit 30  
 ### A7~A8. 선별·Core 확정 (F03·F04·F06·F14·F11)
 1. `$LRA candidates --top 80 --undecided --out state/work/candidates2.md` 를 읽고 제목·초록으로 선별 → `screen` 기록. 우선 목록 외 논문도 **같은 기준**으로 심사.
 2. 기본 배분 **이론 6 / 방법론 6 / 유사 사례 8**을 참고해(연구 유형에 따라 조정, 조정 사유 기록) Core 제안:
-   `$LRA select P-021 P-030 --roles theory --reason "..."` (복수 역할 논문은 `--roles theory,empirical`, 1편으로 계산). **우선 출처 밖 문헌은 `--reason`에 선정 이유를 반드시 쓴다**(03 CSV `우선출처밖_선정이유`로 나감).
+   `$LRA select P-021 P-030 --roles theory --reason "..."` (복수 역할 논문은 `--roles theory,empirical`, 1편으로 계산). **우선 출처 밖 문헌은 `--outside-reason "..."`에 이 출처에서 고른 이유를 따로 쓴다**(03 CSV `우선출처밖_선정이유`로 나가며, 일반 `--reason`과 별도로 V05가 확인).
 3. 점검: `$LRA dedup` · `$LRA bibcheck` · `$LRA integrity`
    - `MISMATCH`/`DOI_NOT_FOUND` → `show`로 확인 후 교체 또는 `확인 필요` 표기.
    - `RETRACTED` → Core에서 제외 제안(`deselect --status REPLACEMENT_NEEDED`), 사용자에게 알림. `CORRECTED`·`EXPRESSION_OF_CONCERN` → 카드와 보고서에 표시.
@@ -191,6 +191,9 @@ $LRA render 05 06
 ```bash
 $LRA verify        # → out/16_검증결과.md
 ```
+- `verify`는 FAIL이 있으면 **종료 코드 1**로 끝난다. 실행 오류가 아니라 고칠 것이 있다는 뜻이므로 JSON의 `fail`을 읽고 처리한다.
+- 판정은 PASS·WARN·FAIL 외에 **INSUFFICIENT**(원문 확보율·원문 확인 인용 비율이 50% 미만 등 보증 불가)와 **N/A**(검사 대상 없음)가 있다. FAIL 0건이어도 INSUFFICIENT·N/A 항목은 검증된 것이 아니므로 사용자에게 그대로 알린다.
+- V07은 09·11 본문 초안(`state/notes/*_body.md`)에서 UNVERIFIED·CONFLICT 근거를 인용하거나, 따옴표 직접 인용이 그 E-ID의 발췌와 다르면 FAIL이다. V06은 `state/text/`가 PDF에서 새로 추출한 텍스트와 다르면 FAIL이다(`$LRA evidence reverify --reextract`로 복구).
 - **FAIL은 모두 고친 뒤** 다시 `render` → `verify`. 고칠 수 없으면(예: 원문 미확보) 사유를 보고서 Ⅶ에 적고 사용자에게 알린다.
 - V05(자동 부분)는 Stage B·C 실행 여부, B·C의 출처 제한 여부, 미등록 출처 ID 사용, '출처 밖' 제외 사유, 우선 출처 밖 문헌의 선정 사유, coverage 기록을 점검한다.
 - V16은 저장된 점수·순위를 기준 점수와 가중치로 다시 계산해 일치하는지, 근거 없는 점수·사유 없는 고정·인용지표를 근거로 쓴 흔적·미평가·이전 버전 기준 평가를 점검한다. V17(KCI/통합)은 실측 여부·KCI 검색 기록·중복 검토 대기·의심 병합·KCI 모드 혼합을 점검한다(INTERNATIONAL이면 N/A).

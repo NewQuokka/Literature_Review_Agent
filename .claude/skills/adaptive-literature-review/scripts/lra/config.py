@@ -13,6 +13,9 @@ import requests
 USER_AGENT = "adaptive-literature-review/0.1 (research support tool; python-requests)"
 QUOTE_MAX_WORDS = 40          # 직접 인용 상한(저작권상 짧은 발췌)
 CORE_TARGET = 20              # 합의된 Core 목표치(의무 아님)
+EVIDENCE_TYPES = ("concept", "theory", "method", "finding", "statistic", "result", "limitation", "definition")
+MIN_FULLTEXT_RATE = 0.5       # Core+Extended 원문 확보율이 이보다 낮으면 V06 INSUFFICIENT(#11)
+MIN_VERIFIED_QUOTE_RATE = 0.5  # 직접 인용 중 원문 대조 확인 비율이 이보다 낮으면 V07 INSUFFICIENT
 INTEGRITY_MAX_AGE = 24 * 3600  # 정정·철회 조회 캐시 유효기간(초). 철회 공지는 사후에 나오므로 짧게 둔다
 INTEGRITY_STALE_DAYS = 30     # 마지막 정정·철회 점검이 이보다 오래되면 V14 WARN
 

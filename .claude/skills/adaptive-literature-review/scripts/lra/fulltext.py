@@ -402,6 +402,43 @@ def locate_quote(paths: Paths, pid: str, quote: str) -> list[int]:
     return hits
 
 
+def verified_page(paths: Paths, pid: str, quote: str) -> int | None:
+    """쪽 미기재 인용이 한 쪽에서만 발견됐을 때 그 쪽(자동 보정값을 pdf_page에 저장하기 위함)."""
+    hits = locate_quote(paths, pid, quote) if quote else []
+    return hits[0] if len(hits) == 1 else None
+
+
+def text_drift(con, paths: Paths, pid: str) -> list[int] | None:
+    """state/text/의 쪽별 텍스트가 PDF에서 새로 추출한 것과 다른 쪽 번호. PDF가 없으면 None.
+    대조 기준 텍스트가 고쳐지면 인용 대조가 무의미해지므로 verify가 PDF와 다시 맞춰 본다(#4)."""
+    r = con.execute("SELECT file_path FROM fulltexts WHERE paper_id=? AND access_status='FULL_PDF'", (pid,)).fetchone()
+    if not r or not r[0] or not Path(r[0]).exists():
+        return None
+    d = paths.text / pid
+    doc = pymupdf.open(r[0])
+    try:
+        fresh = [page.get_text("text") for page in doc]
+    finally:
+        doc.close()
+    have = sorted(d.glob("p*.txt")) if d.exists() else []
+    bad = [i for i, t in enumerate(fresh, 1)
+           if not (d / f"p{i:03d}.txt").exists() or (d / f"p{i:03d}.txt").read_text(encoding="utf-8") != t]
+    bad += [int(f.stem[1:]) for f in have if int(f.stem[1:]) > len(fresh)]   # PDF에 없는 쪽 파일
+    return bad
+
+
+def reextract(con, paths: Paths, pid: str) -> bool:
+    """PDF에서 쪽별 텍스트를 다시 만든다. PDF가 없으면 False."""
+    r = con.execute("SELECT file_path FROM fulltexts WHERE paper_id=? AND access_status='FULL_PDF'", (pid,)).fetchone()
+    if not r or not r[0] or not Path(r[0]).exists():
+        return False
+    tdir = paths.text / pid
+    if tdir.exists():
+        shutil.rmtree(tdir)
+    extract_pages(Path(r[0]), tdir)
+    return True
+
+
 def verify_evidence_item(con, paths: Paths, ev: dict) -> tuple[str, str]:
     """인용·위치를 실제 원문과 대조해 검증상태를 결정한다(모델의 자기신고를 믿지 않음)."""
     pid = ev["paper_id"]

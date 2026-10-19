@@ -8,8 +8,9 @@ import time
 from pathlib import Path
 
 from . import db
-from .config import CORE_TARGET, INTEGRITY_STALE_DAYS, QUOTE_MAX_WORDS, Paths
-from .fulltext import MIN_PDF_BYTES, TITLE_MATCH_MIN, sha256, verify_evidence_item, page_text
+from .config import (CORE_TARGET, INTEGRITY_STALE_DAYS, MIN_FULLTEXT_RATE, MIN_VERIFIED_QUOTE_RATE,
+                     QUOTE_MAX_WORDS, Paths)
+from .fulltext import MIN_PDF_BYTES, TITLE_MATCH_MIN, sha256, text_drift, verify_evidence_item, page_text
 from .papers import norm_title
 from .render import member_rows
 
@@ -17,7 +18,54 @@ REQUIRED = ["01_연구맥락_검색전략.md", "01a_우선학술출처_선정표
             "05_원문확보_현황.csv", "06_원문다운로드_요청목록.md", "07_논문별_분석카드.md", "08_인용근거_라이브러리.md",
             "09_선행연구_비교분석.md", "10_연구계획_문헌활용계획.md", "11_선행연구_종합보고서.md", "12_연구공백_및_확장계획.md"]
 DOI_RE = re.compile(r"10\.\d{4,9}/[^\s|)\]<>`\"',;]+")
-NUM_RE = re.compile(r"(?<![\w.,])[-−]?\d{1,3}(?:,\d{3})+(?:\.\d+)?%?|(?<![\w.,])[-−]?\d+(?:\.\d+)?%?")   # 천단위 쉼표 숫자를 하나로
+NUM_RE = re.compile(r"(?<![\w.,])[-−–]?\d{1,3}(?:,\d{3})+(?:\.\d+)?%?(?![\d.,]\d)"
+                    r"|(?<![\w.,])[-−–]?(?:\d+(?:\.\d+)?|\.\d+)%?(?![\d.,]\d)")   # 천단위 쉼표 숫자·소수 앞 0 생략(.32)
+
+
+def norm_num(n: str) -> str:
+    """비교용 숫자 표기: 유니코드 마이너스·천단위 쉼표·% 제거, '.32'→'0.32'(#11)."""
+    n = n.replace("−", "-").replace("–", "-").replace(",", "").rstrip("%")
+    if n.startswith("-."):
+        n = "-0" + n[1:]
+    elif n.startswith("."):
+        n = "0" + n
+    return n
+
+
+QUOTE_MARKS_RE = re.compile(r"[“\"]([^”\"\n]{8,400})[”\"]")
+CITE_NEAR = 160   # 직접 인용 뒤 이 글자 수 안의 [P-xxx; E-xxx-yy]를 그 인용의 근거로 본다
+
+
+def body_citation_issues(con, paths: Paths, status_now: dict) -> tuple[list, list, list]:
+    """보고서 본문 초안(09·11)에서 (사용 금지 근거 인용, 근거와 다른 직접 인용, 근거 없는 직접 인용)(#4)."""
+    from .fulltext import find_segments, norm_text, quote_segments, _squash
+    bad, mismatch, orphan = [], [], []
+    for key in ("09", "11"):
+        f = paths.state / "notes" / f"{key}_body.md"
+        if not f.exists():
+            continue
+        t = f.read_text(encoding="utf-8")
+        for eid in sorted(set(re.findall(r"E-\d{3,}-\d{2,}", t))):
+            st = status_now.get(eid)
+            if st in ("UNVERIFIED", "CONFLICT", "METADATA_ONLY"):
+                bad.append(f"{key}:{eid}({st})")
+        for m in QUOTE_MARKS_RE.finditer(t):
+            segs, why = quote_segments(m.group(1))
+            if why:   # 강조용 짧은 따옴표는 직접 인용으로 보지 않음
+                continue
+            near = re.findall(r"E-\d{3,}-\d{2,}", t[m.end():m.end() + CITE_NEAR])
+            if not near:
+                orphan.append(f"{key}:\"{m.group(1)[:30]}…\"")
+                continue
+            ok = False
+            for eid in near:
+                row = con.execute("SELECT verbatim_short_quote FROM evidence WHERE evidence_id=?", (eid,)).fetchone()
+                if row and row[0] and find_segments(_squash(norm_text(row[0])), segs):
+                    ok = True
+                    break
+            if not ok:
+                mismatch.append(f"{key}:\"{m.group(1)[:30]}…\"→{near}")
+    return bad, mismatch, orphan
 
 
 def raw_manifest(paths: Paths) -> dict:
@@ -41,7 +89,7 @@ def run(con, paths: Paths) -> tuple[str, dict]:
     bad = [f"{r['paper_id']}({r['bib_match']})" for r in core if r["bib_match"] in ("MISMATCH", "DOI_NOT_FOUND")]
     unchecked = [r["paper_id"] for r in core if not r["bib_match"]]
     nodoi = [r["paper_id"] for r in core if not r["doi"]]
-    add("V01", "서지정보 정확성(Crossref 대조)", "FAIL" if bad else ("WARN" if unchecked else "PASS"),
+    add("V01", "서지정보 정확성(Crossref 대조)", "FAIL" if bad else ("WARN" if unchecked or nodoi else "PASS"),
         f"불일치 {len(bad)}건 {bad}; 미점검 {len(unchecked)}건 {unchecked[:10]}; DOI 없음 {len(nodoi)}건 {nodoi} (자동 제외하지 않음)")
 
     # V04 중복
@@ -107,9 +155,9 @@ def run(con, paths: Paths) -> tuple[str, dict]:
     pref_ids = db.all_preferred_ids(con)
     outside_rows = [r for r in core if r["venue_source_id"] not in pref_ids]
     outside = [r["paper_id"] for r in outside_rows]
-    no_reason = [r["paper_id"] for r in outside_rows if not (r["m_reason"] or "").strip()]
-    if no_reason:
-        v5_warn.append(f"우선 출처 밖 문헌의 선정 사유 없음: {no_reason}")
+    no_reason = [r["paper_id"] for r in outside_rows if not (r["outside_reason"] or "").strip()]
+    if no_reason:   # 일반 선정 사유(--reason, 필수)와 별도 필드로 확인한다(#11)
+        v5_warn.append(f"우선 출처 밖 문헌의 출처 밖 선정 사유(--outside-reason) 없음: {no_reason}")
     no_src = [r["paper_id"] for r in core if not r["venue_source_id"] and r["openalex_id"]]
     if no_src:
         v5_warn.append(f"출처 ID 미기록(구버전 레코드 → `refresh` 실행): {no_src}")
@@ -137,34 +185,64 @@ def run(con, paths: Paths) -> tuple[str, dict]:
             issues.append(f"{ft['paper_id']}: 제목 일치도 {ft['title_match']}")
         if ft["paper_id"] not in f.name:
             issues.append(f"{ft['paper_id']}: 파일명-P-ID 불일치")
+        drift = text_drift(con, paths, ft["paper_id"])
+        if drift:
+            issues.append(f"{ft['paper_id']}: 대조 기준 텍스트(state/text)가 PDF와 다름 p.{drift[:5]} "
+                          "— `evidence reverify --reextract`")
     tried = con.execute("SELECT COUNT(*) FROM fulltexts").fetchone()[0]
-    add("V06", "원문 확보 정확성", "FAIL" if issues else ("WARN" if undecided else "PASS"),
-        (f"유효 전문 {n_full}편 / 시도 {tried}편 (전문 확보율 {n_full / tried * 100:.0f}%)" if tried else "확보 시도 없음")
+    core_full = sum(1 for r in core if db.fulltext_status(con, r["paper_id"]) in ("FULL_PDF", "FULL_XML"))
+    ft_rate = core_full / len(core) if core else 0.0
+    v6 = ("FAIL" if issues else "N/A" if not tried else "INSUFFICIENT" if ft_rate < MIN_FULLTEXT_RATE
+          else "WARN" if undecided else "PASS")
+    add("V06", "원문 확보 정확성", v6,
+        f"Core+Extended 원문 확보 {core_full}/{len(core)}편({ft_rate * 100:.0f}%, 기준 {MIN_FULLTEXT_RATE * 100:.0f}%)"
+        + (f"; 유효 전문 {n_full}편 / 시도 {tried}편" if tried else "; 확보 시도 없음")
         + (f"; 문제 {issues}" if issues else "")
         + (f"; 제목 판정 불가(사람 확인) {undecided}" if undecided else ""))
 
-    # V07 직접 인용
-    v7, long_q, changed = [], [], []
+    # V07 직접 인용 + 보고서 본문(09·11)에서의 사용(#4)
+    v7, long_q, changed, n_quotes, n_ok = [], [], [], 0, 0
+    status_now = {}
     for e in con.execute("SELECT * FROM evidence"):
         q = e["verbatim_short_quote"]
         if not q:
+            status_now[e["evidence_id"]] = e["verification_status"]
             continue
+        n_quotes += 1
         if len(q.split()) > QUOTE_MAX_WORDS:
             long_q.append(e["evidence_id"])
         st, note = verify_evidence_item(con, paths, dict(e))
+        status_now[e["evidence_id"]] = st
         if st != e["verification_status"]:
             changed.append(f"{e['evidence_id']}: 기록 {e['verification_status']} → 재검증 {st}")
         if st in ("UNVERIFIED", "CONFLICT"):
             v7.append(f"{e['evidence_id']}({st})")
-    add("V07", "직접인용 정확성(원문 글자 대조)", "FAIL" if changed or long_q else ("WARN" if v7 else "PASS"),
-        f"미검증/충돌 인용 {len(v7)}건 {v7[:15]} (보고서 사용 금지 대상); 상태 변동 {changed}; {QUOTE_MAX_WORDS}단어 초과 {long_q}")
+        elif st == "VERIFIED_FULLTEXT":
+            n_ok += 1
+    body_bad, body_quote_bad, body_quote_orphan = body_citation_issues(con, paths, status_now)
+    q_rate = n_ok / n_quotes if n_quotes else 0.0
+    if changed or long_q or body_bad or body_quote_bad:
+        v7v = "FAIL"
+    elif not n_quotes and not body_quote_orphan:
+        v7v = "N/A"
+    elif n_quotes and q_rate < MIN_VERIFIED_QUOTE_RATE:
+        v7v = "INSUFFICIENT"
+    else:
+        v7v = "WARN" if v7 or body_quote_orphan else "PASS"
+    add("V07", "직접인용 정확성(원문 대조)·본문 사용", v7v,
+        (f"직접 인용 {n_quotes}건 중 원문 확인 {n_ok}건({q_rate * 100:.0f}%, 기준 {MIN_VERIFIED_QUOTE_RATE * 100:.0f}%)"
+         if n_quotes else "등록된 직접 인용 없음")
+        + f"; 미검증/충돌 {len(v7)}건 {v7[:15]}; 본문(09·11)에 인용한 사용 금지 근거 {body_bad}; "
+        f"본문 직접 인용이 근거 발췌와 다름 {body_quote_bad}; 근거 ID 없는 본문 직접 인용 {body_quote_orphan}; "
+        f"상태 변동 {changed}; {QUOTE_MAX_WORDS}단어 초과 {long_q}")
 
     # V08 수치 대조(재서술 속 숫자가 인용문·해당 쪽에 있는지)
-    v8 = []
+    v8, n_num = [], 0
     for e in con.execute("SELECT * FROM evidence WHERE type IN ('finding','statistic','result')"):
-        nums = set(n.replace("−", "-") for n in NUM_RE.findall(e["paraphrase"] or "")) - {"1", "2", "3"}
+        nums = {norm_num(n) for n in NUM_RE.findall(e["paraphrase"] or "")} - {"1", "2", "3"}
         if not nums:
             continue
+        n_num += 1
         src = (e["verbatim_short_quote"] or "")
         if e["pdf_page"] and db.fulltext_status(con, e["paper_id"]) in ("FULL_PDF", "FULL_XML"):
             for pg in (int(e["pdf_page"]) - 1, int(e["pdf_page"]), int(e["pdf_page"]) + 1):   # 표가 다음 쪽으로 넘어가는 경우
@@ -173,11 +251,13 @@ def run(con, paths: Paths) -> tuple[str, dict]:
         if not src.strip():
             p = con.execute("SELECT abstract FROM papers WHERE paper_id=?", (e["paper_id"],)).fetchone()
             src = (p["abstract"] or "") if p else ""
-        missing = [n for n in nums if n.replace(",", "") not in src]
+        have = {norm_num(n) for n in NUM_RE.findall(src)}   # 부분 문자열이 아니라 숫자 토큰으로 대조(#11)
+        missing = sorted(n for n in nums if n not in have)
         if missing:
             v8.append(f"{e['evidence_id']}: {missing}")
-    add("V08", "연구결과 수치 대조", "WARN" if v8 else "PASS",
-        (f"원문/초록에서 찾지 못한 수치 {v8} — 사람이 확인" if v8 else "재서술의 수치가 모두 근거 텍스트에서 발견됨")
+    add("V08", "연구결과 수치 대조", "N/A" if not n_num else ("WARN" if v8 else "PASS"),
+        ("수치가 든 결과 근거 없음" if not n_num else
+         f"수치 근거 {n_num}건; " + (f"원문/초록에서 찾지 못한 수치 {v8} — 사람이 확인" if v8 else "재서술의 수치가 모두 근거 텍스트에서 발견됨"))
         + " (부호·유의성 해석의 정확성은 사람 검토 필요)")
 
     # V13 라이선스·보안
@@ -333,7 +413,13 @@ def run(con, paths: Paths) -> tuple[str, dict]:
 
     human = [("V16", "중요도 상위문헌의 전문가 판정 일치"), ("V17", "KCI·해외 병합 정확도(사람 확인)"), ("V02", "Seed 역할 적합성"), ("V03", "Core 적합성(Precision@20)"), ("V05", "검색 포괄성(Recall·중요 누락, 정답 대조)"),
              ("V09", "품질 검토 적정성"), ("V10", "장절 매핑 유용성"), ("V11", "피드백 기반 확장"), ("V12", "검색 효율(우선 출처 사용/미사용 비교)·실무 시간 절감")]
-    L = ["# 16 검증결과", "", f"- 검증 일시: {db.now()}", "- 판정: PASS / WARN(사람 확인 필요) / FAIL(수정 필요)", "",
+    count = {k: [r[0] for r in res if r[2] == k] for k in ("FAIL", "WARN", "INSUFFICIENT", "N/A", "PASS")}
+    headline = (f"FAIL {len(count['FAIL'])} · WARN {len(count['WARN'])} · INSUFFICIENT {len(count['INSUFFICIENT'])} "
+                f"· N/A {len(count['N/A'])} · PASS {len(count['PASS'])} — 원문 확보 {ft_rate * 100:.0f}%, "
+                f"직접 인용 원문 확인 {n_ok}/{n_quotes}")
+    L = ["# 16 검증결과", "", f"**{headline}**", "", f"- 검증 일시: {db.now()}",
+         "- 판정: PASS / WARN(사람 확인 필요) / FAIL(수정 필요) / INSUFFICIENT(검사 대상이 기준보다 적어 보증 불가) / N/A(검사 대상 없음)",
+         "- **FAIL 0건이어도 INSUFFICIENT·N/A가 있으면 그 항목은 검증된 것이 아니다.**", "",
          "## 1. 자동 검증", "", "| ID | 항목 | 판정 | 내용 |", "|---|---|---|---|"]
     for i, n, v, d in res:
         L.append(f"| {i} | {n} | **{v}** | {str(d).replace('|', '/')} |")
@@ -341,8 +427,9 @@ def run(con, paths: Paths) -> tuple[str, dict]:
     L += [f"| {i} | {n} | 미검증 — Gold Standard·연구자 평가 필요 〔확인 필요〕 |" for i, n in human]
     fails = [r for r in res if r[2] == "FAIL"]
     L += ["", "## 3. 종합", "",
-          f"- FAIL {len(fails)}건, WARN {sum(1 for r in res if r[2] == 'WARN')}건.",
+          f"- {headline}.",
           "- MVP 완료 판정에는 V01·V04·V05·V06·V07·V08·V13·V15·V16의 중대 오류 0건과 파일럿 실측이 필요하다. 실측 전 상태는 **미검증**.",
           "- KCI/통합 기능 완료는 V17(실제 API 검색·국내외 중복 검증) 통과가 추가로 필요하다(2차)."]
-    summary = {"fail": [r[0] for r in fails], "warn": [r[0] for r in res if r[2] == "WARN"]}
+    summary = {"fail": count["FAIL"], "warn": count["WARN"], "insufficient": count["INSUFFICIENT"], "na": count["N/A"],
+               "fulltext_rate": round(ft_rate, 2), "verified_quotes": f"{n_ok}/{n_quotes}"}
     return "\n".join(L) + "\n", summary

@@ -168,6 +168,7 @@ MIGRATIONS = {
     "search_runs": [("source_ids", "TEXT"), ("search_stage", "TEXT"), ("scope_expansion_reason", "TEXT"),
                     ("api_calls", "INTEGER"), ("cost_usd", "REAL"), ("search_mode", "TEXT"), ("language", "TEXT")],
     "preferred_sources": [("source_db", "TEXT"), ("kci_index_status", "TEXT")],
+    "paper_memberships": [("outside_reason", "TEXT")],
 }
 MODES = ("INTERNATIONAL", "KCI", "INTEGRATED")
 CRITERIA = ("research_fit", "role_contribution", "evidence_quality", "distinctiveness", "time_relevance")
@@ -238,15 +239,16 @@ def log_event(con, command: str, detail) -> None:
 
 
 def set_membership(con, paper_id: str, tier: str, status: str, reason: str = "",
-                   review_by: str = "agent") -> None:
+                   review_by: str = "agent", outside_reason: str | None = None) -> None:
     pid = project_id(con)
     ver = current_version(con)
-    con.execute("""INSERT INTO paper_memberships(project_id, paper_id, tier, status, reason, selected_at, review_by, version_id)
-                   VALUES (?,?,?,?,?,?,?,?)
+    con.execute("""INSERT INTO paper_memberships(project_id, paper_id, tier, status, reason, selected_at, review_by, version_id,
+                   outside_reason) VALUES (?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(project_id, paper_id) DO UPDATE SET tier=excluded.tier, status=excluded.status,
                    reason=excluded.reason, selected_at=excluded.selected_at, review_by=excluded.review_by,
-                   version_id=excluded.version_id""",
-                (pid, paper_id, tier, status, reason, now(), review_by, ver))
+                   version_id=excluded.version_id,
+                   outside_reason=COALESCE(excluded.outside_reason, paper_memberships.outside_reason)""",
+                (pid, paper_id, tier, status, reason, now(), review_by, ver, outside_reason))
     con.execute("INSERT INTO membership_history(paper_id, tier, status, reason, changed_at, version_id) VALUES (?,?,?,?,?,?)",
                 (paper_id, tier, status, reason, now(), ver))
 

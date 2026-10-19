@@ -12,6 +12,7 @@ from . import db
 from .config import CORE_TARGET, Paths
 
 ROLE_KO = {"theory": "이론", "methodology": "방법론", "empirical": "유사 실증사례"}
+USABLE_EVIDENCE = ("VERIFIED_FULLTEXT", "ABSTRACT_BASED")   # 보고서 본문에서 인용해도 되는 근거 상태
 PID_RE = re.compile(r"\[(P-\d{3,})(?:[,;]\s*(E-\d{3,}-\d{2,}(?:[,;]\s*E-\d{3,}-\d{2,})*))?\]")
 
 
@@ -76,7 +77,7 @@ def paper(con, pid):
 
 
 def member_rows(con, tiers=("CORE", "EXTENDED"), include_rejected=False):
-    q = f"""SELECT p.*, m.tier, m.status, m.reason AS m_reason FROM papers p JOIN paper_memberships m USING(paper_id)
+    q = f"""SELECT p.*, m.tier, m.status, m.reason AS m_reason, m.outside_reason FROM papers p JOIN paper_memberships m USING(paper_id)
             WHERE m.tier IN ({','.join('?' * len(tiers))})"""
     if not include_rejected:
         q += " AND m.status!='REJECTED'"
@@ -114,11 +115,13 @@ def cite_replace(con, text: str, cited: set) -> str:
         cited.add(pid)
         labels = []
         for eid in re.findall(r"E-\d{3,}-\d{2,}", m.group(2) or ""):
-            row = con.execute("SELECT paper_id FROM evidence WHERE evidence_id=?", (eid,)).fetchone()
+            row = con.execute("SELECT paper_id, verification_status FROM evidence WHERE evidence_id=?", (eid,)).fetchone()
             if not row:
                 labels.append(f"{eid} — ⚠ DB에 없는 ID")
             elif row[0] != pid:
                 labels.append(f"{eid} — ⚠ {pid}의 근거 아님")
+            elif row[1] not in USABLE_EVIDENCE:
+                labels.append(f"{eid} — ⚠ {row[1]}(사용 금지)")   # 규칙 2: 확인되지 않은 근거를 깔끔하게 렌더하지 않음(#4)
             else:
                 labels.append(eid)
         ev = "; " + ", ".join(labels) if labels else ""
@@ -421,7 +424,7 @@ def r03(con, paths):
                         r["db_origin"] or "OPENALEX", r["kci_id"] or "", r["venue"], r["venue_source_id"] or "", r["venue_type"] or "",
                         "Y" if in_pref else "N", "".join(paper_stages(con, r["paper_id"])), r["doi"], r["openalex_id"],
                         r["canonical_work_id"] or "", " | ".join(discovery_paths(con, r["paper_id"])),
-                        r["m_reason"], "" if in_pref else (r["m_reason"] or "확인 필요"),
+                        r["m_reason"], "" if in_pref else (r["outside_reason"] or "확인 필요"),
                         db.fulltext_status(con, r["paper_id"]), r["bib_match"] or "NOT_CHECKED",
                         db.integrity_status(con, r["paper_id"]), aux_indicators(r)])
     return None  # 직접 기록
@@ -623,7 +626,8 @@ def r07(con, paths):
                 evs = con.execute("SELECT * FROM evidence WHERE paper_id=? ORDER BY evidence_id", (r["paper_id"],)).fetchall()
                 if evs:
                     v = [f"{e['evidence_id']} [{e['verification_status']}] "
-                         + (f"\"{e['verbatim_short_quote']}\" (PDF p.{e['pdf_page']}) — " if e['verbatim_short_quote'] and e['verification_status'] in ('VERIFIED_FULLTEXT', 'ABSTRACT_BASED') else "")
+                         + (f"\"{e['verbatim_short_quote']}\"" + (f" (PDF p.{e['pdf_page']})" if e['pdf_page'] else "") + " — "
+                            if e['verbatim_short_quote'] and e['verification_status'] in USABLE_EVIDENCE else "")
                          + (e["paraphrase"] or "") for e in evs]
             L += [f"**{lab}**", "", _fmt(v), ""]
         L.append("---\n")
@@ -648,7 +652,7 @@ def r08(con, paths):
         if e["pdf_page"] and e["verification_status"] in ("VERIFIED_FULLTEXT", "CONFLICT", "UNVERIFIED") and db.fulltext_status(con, e["paper_id"]) in ("FULL_PDF", "FULL_XML"):
             ver = (con.execute("SELECT version FROM fulltexts WHERE paper_id=?", (e["paper_id"],)).fetchone() or [None])[0]
             loc.append(f"PDF p.{e['pdf_page']}" + (f" ({VERSION_KO.get(ver, ver)} — 출판본 쪽수 아님)" if ver and ver != "publishedVersion" else ""))
-        if e["printed_page"]:
+        if e["printed_page"] and e["verification_status"] == "VERIFIED_FULLTEXT":   # 원문 대조가 끝난 근거만(#4)
             loc.append(f"인쇄 p.{e['printed_page']}")
         if e["section_or_table"]:
             loc.append(e["section_or_table"])

@@ -936,6 +936,8 @@ def cmd_mode(a):
             con.execute("SELECT mode_settings FROM projects").fetchone()[0] or "{}"),
              "kci_ready": ok, "kci_status": why})
         return
+    if not a.mode:   # 빠뜨리면 INTERNATIONAL로 바뀌던 문제(#13)
+        raise SystemExit(f"mode set에는 모드가 필요합니다: {' | '.join(db.MODES)}")
     mode = a.mode.upper()
     if mode not in db.MODES:
         raise SystemExit(f"모드는 {db.MODES}")
@@ -1085,6 +1087,8 @@ def cmd_rank(a):
         items = load_json(a.file)
         res = RK.add_scores(con, items if isinstance(items, list) else [items], a.by)
     elif a.action == "pin":
+        if a.rank is None:   # 빠뜨리면 고정이 아니라 해제로 동작하던 문제(#13)
+            raise SystemExit("rank pin에는 --rank N이 필요합니다(해제는 `rank unpin`).")
         res = [RK.pin(con, pid_ok(con, p), a.rank, a.reason, a.by or "agent") for p in a.papers]
     elif a.action == "unpin":
         res = [RK.pin(con, pid_ok(con, p), None, None, a.by or "agent") for p in a.papers]
@@ -1165,6 +1169,8 @@ def main():
     ap = argparse.ArgumentParser(description="Adaptive Literature Review Agent tools")
     ap.add_argument("--root", help="프로젝트 루트(기본: 현재 폴더)")
     ap.add_argument("--no-cache", action="store_true", help="HTTP 캐시 무시")
+    from lra import __version__
+    ap.add_argument("--version", action="version", version=f"adaptive-literature-review {__version__}")
     ap.add_argument("--all-types", action="store_true", help="심사기록·정오표 등 비논문 레코드도 포함")
     sp = ap.add_subparsers(dest="cmd", required=True)
 
@@ -1250,7 +1256,7 @@ def main():
     s.add_argument("--distinct", nargs=2, metavar=("A", "B"), help="별개 연구로 확정")
     s.set_defaults(f=cmd_dedup)
     s = sp.add_parser("mode", help="검색 모드 INTERNATIONAL / KCI / INTEGRATED")
-    s.add_argument("action", choices=["set", "show"]); s.add_argument("mode", nargs="?", default="INTERNATIONAL")
+    s.add_argument("action", choices=["set", "show"]); s.add_argument("mode", nargs="?", help="set일 때 필수")
     s.add_argument("--reason"); s.add_argument("--domestic-share", help="통합 모드 국내외 비중 메모(고정 비율 아님)")
     s.set_defaults(f=cmd_mode)
     s = sp.add_parser("kci", help="KCI Open API 실측(인증키 필요)")

@@ -245,4 +245,4 @@ def test_rank_approve_records_approver(project):
 def test_permissions_ask_file():
     cfg = json.loads((SCRIPTS.parents[3] / ".claude/settings.json").read_text(encoding="utf-8"))
     ask = cfg["permissions"]["ask"]
-    assert any(r.endswith("lra.py approve:*)") for r in ask) and any("rank pin" in r for r in ask)
+    assert "Bash(python*lra.py* approve*)" in ask and any("rank pin" in r for r in ask)

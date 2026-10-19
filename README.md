@@ -38,6 +38,8 @@ https://github.com/user-attachments/assets/ac382c96-bfc7-4076-b0d0-20296674a76f
 - Python 3.10 이상
 - 인터넷 연결
 
+> PDF 처리에 쓰는 [PyMuPDF](https://pymupdf.readthedocs.io/)는 **AGPL-3.0(또는 상용) 라이선스**입니다. 이 저장소는 MIT이지만, 도구를 웹 서비스로 제공하거나 다른 프로그램과 묶어 배포하려면 PyMuPDF의 AGPL 조건을 따로 확인하세요.
+
 ### 1단계 — 내려받고 설치하기
 
 이 저장소를 내려받은 뒤, 폴더 안에서 패키지를 설치합니다.
@@ -50,6 +52,18 @@ python -m pip install -r requirements.txt
 
 ```bash
 python .claude/skills/adaptive-literature-review/scripts/lra.py status
+```
+
+### 도구 설치 위치와 연구 폴더 분리 (선택)
+
+기본은 **이 저장소 폴더 안에서 연구**하는 방식입니다. 연구 주제마다 저장소를 새로 받기 싫거나 도구와 연구 자료를 따로 두고 싶다면 이렇게 하세요.
+
+1. `.claude/skills/adaptive-literature-review` 폴더를 `~/.claude/skills/`(모든 프로젝트에서 사용) 또는 연구 폴더의 `.claude/skills/`에 복사합니다. 명령 경로는 Claude Code가 `${CLAUDE_SKILL_DIR}`로 알아서 맞춥니다.
+2. 승인 확인 창을 쓰려면 저장소의 `.claude/settings.json` 내용을 `~/.claude/settings.json`이나 연구 폴더의 `.claude/settings.json`에 합쳐 넣습니다.
+3. Claude Code를 **연구 폴더에서** 열면 `raw/ state/ library/ out/`이 그 폴더에 생깁니다. 직접 실행할 때 다른 폴더를 지정하려면 `--root`를 씁니다.
+
+```bash
+python ~/.claude/skills/adaptive-literature-review/scripts/lra.py --root ~/research/rd-subsidy status
 ```
 
 ### 2단계 — OpenAlex API 키 넣기 (권장)
@@ -297,6 +311,8 @@ python .claude/skills/adaptive-literature-review/scripts/lra.py -h
 .
 ├── README.md · LICENSE · requirements.txt
 ├── CLAUDE.md                    이 폴더에서 일하는 Claude용 짧은 지침
+├── .claude/settings.json        승인 등 결정 명령의 확인 창 설정
+├── tests/ · pytest.ini          자동 테스트(개발용)
 └── .claude/skills/adaptive-literature-review/
     ├── SKILL.md                 절차와 판단 원칙
     ├── references/              입력 형식, 보고서 템플릿

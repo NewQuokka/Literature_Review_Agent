@@ -68,11 +68,22 @@ def body_citation_issues(con, paths: Paths, status_now: dict) -> tuple[list, lis
     return bad, mismatch, orphan
 
 
+IGNORED_RAW = {".DS_Store", "Thumbs.db", "desktop.ini"}
+
+
+def ignorable_raw(rel: str) -> bool:
+    """원본 불변 검사에서 빼는 운영체제·편집기 부산물(숨김 파일, Office 잠금 파일 ~$*)(#13)."""
+    name = rel.rsplit("/", 1)[-1]
+    return name in IGNORED_RAW or name.startswith((".", "~$")) or any(p.startswith(".") for p in rel.split("/")[:-1])
+
+
 def raw_manifest(paths: Paths) -> dict:
     out = {}
     for f in sorted(paths.raw.rglob("*")):
         if f.is_file():
-            out[str(f.relative_to(paths.root)).replace("\\", "/")] = sha256(f)
+            rel = str(f.relative_to(paths.root)).replace("\\", "/")
+            if not ignorable_raw(rel):
+                out[rel] = sha256(f)
     return out
 
 
@@ -442,7 +453,7 @@ def run(con, paths: Paths) -> tuple[str, dict]:
 
     # 원본 불변
     if paths.raw_manifest.exists():
-        before = json.loads(paths.raw_manifest.read_text(encoding="utf-8"))
+        before = {k: v for k, v in json.loads(paths.raw_manifest.read_text(encoding="utf-8")).items() if not ignorable_raw(k)}
         now_m = raw_manifest(paths)
         changed = [k for k in before if k in now_m and now_m[k] != before[k]]
         removed = [k for k in before if k not in now_m]
@@ -457,7 +468,8 @@ def run(con, paths: Paths) -> tuple[str, dict]:
     headline = (f"FAIL {len(count['FAIL'])} · WARN {len(count['WARN'])} · INSUFFICIENT {len(count['INSUFFICIENT'])} "
                 f"· N/A {len(count['N/A'])} · PASS {len(count['PASS'])} — 원문 확보 {ft_rate * 100:.0f}%, "
                 f"직접 인용 원문 확인 {n_ok}/{n_quotes}")
-    L = ["# 16 검증결과", "", f"**{headline}**", "", f"- 검증 일시: {db.now()}",
+    from . import __version__
+    L = ["# 16 검증결과", "", f"**{headline}**", "", f"- 검증 일시: {db.now()} · 도구 버전 v{__version__}",
          "- 판정: PASS / WARN(사람 확인 필요) / FAIL(수정 필요) / INSUFFICIENT(검사 대상이 기준보다 적어 보증 불가) / N/A(검사 대상 없음)",
          "- **FAIL 0건이어도 INSUFFICIENT·N/A가 있으면 그 항목은 검증된 것이 아니다.**", "",
          "## 1. 자동 검증", "", "| ID | 항목 | 판정 | 내용 |", "|---|---|---|---|"]
